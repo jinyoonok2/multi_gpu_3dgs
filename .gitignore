@@ -1,0 +1,27 @@
+*.pyc
+.vscode
+output
+build
+diff_rasterization/diff_rast.egg-info
+diff_rasterization/dist
+tensorboard_3d
+screenshots
+expe*
+old_files
+# *.sh
+*.ipynb
+*.txt
+*.log
+*.out
+__pycache__
+*.npy
+scripts/
+data
+results
+_major-revision-scripts/
+deprecated
+run_all.sh
+release_scripts_internal/
+slurm/
+srun/
+core.*
