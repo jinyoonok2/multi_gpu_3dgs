@@ -25,3 +25,4 @@ release_scripts_internal/
 slurm/
 srun/
 core.*
+old/
