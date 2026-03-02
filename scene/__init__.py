@@ -163,7 +163,7 @@ class Scene:
         self.decode_dataset_path = os.path.join(args.decode_dataset_path, "dataset_raw")
 
         if not os.path.isdir(self.decode_dataset_path):
-            os.makedirs(self.decode_dataset_path)
+            os.makedirs(self.decode_dataset_path, exist_ok=True)
             statvfs = os.statvfs(args.decode_dataset_path)
             available_space_in_GB = 1.0 * statvfs.f_frsize * statvfs.f_bavail / 1e9
             assert (

@@ -9,6 +9,7 @@ screenshots
 expe*
 old_files
 # *.sh
+*.sh
 *.ipynb
 *.txt
 *.log
