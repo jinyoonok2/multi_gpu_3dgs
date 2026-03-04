@@ -119,6 +119,14 @@ pip install --no-build-isolation ./submodules/cpu-adam
 pip install ./submodules/fast-tsp
 ```
 
+> **Note — `simple_knn` package structure fix (applied 2026-03-03):**
+> The original `submodules/simple-knn/simple_knn/` directory had no `__init__.py`,
+> so Python did not recognise it as a package when installed in editable mode (`pip install -e .`).
+> A `__init__.py` has been added to `submodules/simple-knn/simple_knn/` that imports `distCUDA2` from
+> the compiled `_C` extension. Without this file, training crashes with
+> `ModuleNotFoundError: No module named 'simple_knn'` on any node except the one the `.so` was built on.
+> This fix is already committed to the repo — no manual action needed.
+
 ### 3. Apply Required Bug Fixes
 
 > **This step is mandatory.** Without these two fixes, training will crash. They are not present in this repo.
