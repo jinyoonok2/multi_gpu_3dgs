@@ -12,13 +12,16 @@ CRITICAL DESIGN — symmetric exchange:
   Both GPUs enter the same function simultaneously.  Non-blocking
   isend/irecv are used to avoid deadlocks.
 
-  Broken pattern:
-    GPU 0: send(count) → send(idx) → recv(feat)   ← DEADLOCK
-    GPU 1: send(count) → send(idx) → recv(feat)   ← both stall on send
+  Broken pattern (sequential isend/irecv):
+    GPU 0: isend(count).wait() → irecv(count).wait() → ...   ← DEADLOCK
+    GPU 1: isend(count).wait() → irecv(count).wait() → ...   ← both stall
+    NCCL P2P isend is a rendezvous: isend().wait() blocks until peer posts
+    a matching irecv. Both ranks block on wait() before posting irecv.
 
-  Correct pattern:
-    GPU 0: isend(count) + irecv(count) → wait → ...   ← no deadlock
-    GPU 1: isend(count) + irecv(count) → wait → ...
+  Correct pattern (batch_isend_irecv):
+    GPU 0: batch([isend(count), irecv(count)]) → wait all   ← no deadlock
+    GPU 1: batch([isend(count), irecv(count)]) → wait all
+    Posts send AND recv atomically before waiting — no rendezvous block.
 
 Protocol per peer (3 phases):
   1. Exchange counts   — tell peer how many indices I need
@@ -45,45 +48,50 @@ def _p2p_symmetric_feature_exchange(gaussians, peer_rank, my_need_indices):
     BOTH ranks must call this simultaneously with their own need_indices.
 
     Returns: (n_need, 48) tensor of SH features fetched from peer.
+
+    Uses dist.batch_isend_irecv() to post all sends+recvs atomically before
+    waiting. Sequential isend().wait() deadlocks because NCCL P2P isend is a
+    rendezvous — it blocks until the peer posts a matching irecv, but the peer
+    is also blocked on its own isend().wait() first.
     """
     n_need = my_need_indices.shape[0]
 
-    # Phase 1: Exchange counts
+    # Phase 1: Exchange counts atomically
     my_count   = torch.tensor([n_need], dtype=torch.long, device="cuda")
     peer_count = torch.empty(1, dtype=torch.long, device="cuda")
-    req_s = dist.isend(my_count,   dst=peer_rank)
-    req_r = dist.irecv(peer_count, src=peer_rank)
-    req_s.wait(); req_r.wait()
+    for r in dist.batch_isend_irecv([
+        dist.P2POp(dist.isend, my_count,   peer_rank),
+        dist.P2POp(dist.irecv, peer_count, peer_rank),
+    ]):
+        r.wait()
     n_peer_needs = int(peer_count.item())
 
-    # Phase 2: Exchange index lists
+    # Phase 2: Exchange index lists atomically
     peer_need_indices = torch.empty(n_peer_needs, dtype=my_need_indices.dtype, device="cuda")
     ops = []
     if n_need > 0:
-        ops.append(dist.isend(my_need_indices.contiguous(), dst=peer_rank))
+        ops.append(dist.P2POp(dist.isend, my_need_indices.contiguous(), peer_rank))
     if n_peer_needs > 0:
-        ops.append(dist.irecv(peer_need_indices, src=peer_rank))
-    for op in ops:
-        op.wait()
+        ops.append(dist.P2POp(dist.irecv, peer_need_indices, peer_rank))
+    if ops:
+        for r in dist.batch_isend_irecv(ops):
+            r.wait()
 
-    # Phase 3: Gather and exchange features
+    # Phase 3: Gather and exchange features atomically
     features_for_peer = (
         gaussians._parameters.detach()[peer_need_indices].contiguous()
         if n_peer_needs > 0
         else torch.empty(0, 48, device="cuda")
     )
-    features_from_peer = (
-        torch.empty(n_need, 48, device="cuda")
-        if n_need > 0
-        else torch.empty(0, 48, device="cuda")
-    )
+    features_from_peer = torch.empty(n_need, 48, device="cuda")
     ops = []
     if n_peer_needs > 0:
-        ops.append(dist.isend(features_for_peer, dst=peer_rank))
+        ops.append(dist.P2POp(dist.isend, features_for_peer, peer_rank))
     if n_need > 0:
-        ops.append(dist.irecv(features_from_peer, src=peer_rank))
-    for op in ops:
-        op.wait()
+        ops.append(dist.P2POp(dist.irecv, features_from_peer, peer_rank))
+    if ops:
+        for r in dist.batch_isend_irecv(ops):
+            r.wait()
 
     return features_from_peer
 
@@ -100,37 +108,37 @@ def _p2p_symmetric_gradient_exchange(gaussians, peer_rank,
     """
     n_send = grads_for_peer.shape[0]
 
-    # Phase 1: Exchange counts
+    # Phase 1: Exchange counts atomically
     my_count   = torch.tensor([n_send], dtype=torch.long, device="cuda")
     peer_count = torch.empty(1, dtype=torch.long, device="cuda")
-    req_s = dist.isend(my_count,   dst=peer_rank)
-    req_r = dist.irecv(peer_count, src=peer_rank)
-    req_s.wait(); req_r.wait()
+    for r in dist.batch_isend_irecv([
+        dist.P2POp(dist.isend, my_count,   peer_rank),
+        dist.P2POp(dist.irecv, peer_count, peer_rank),
+    ]):
+        r.wait()
     n_recv = int(peer_count.item())
 
-    # Phase 2: Exchange indices
+    # Phase 2: Exchange indices atomically
     recv_indices = torch.empty(n_recv, dtype=torch.long, device="cuda")
     ops = []
     if n_send > 0:
-        ops.append(dist.isend(indices_on_peer.contiguous(), dst=peer_rank))
+        ops.append(dist.P2POp(dist.isend, indices_on_peer.contiguous(), peer_rank))
     if n_recv > 0:
-        ops.append(dist.irecv(recv_indices, src=peer_rank))
-    for op in ops:
-        op.wait()
+        ops.append(dist.P2POp(dist.irecv, recv_indices, peer_rank))
+    if ops:
+        for r in dist.batch_isend_irecv(ops):
+            r.wait()
 
-    # Phase 3: Exchange gradient values
-    recv_grads = (
-        torch.empty(n_recv, 48, device="cuda")
-        if n_recv > 0
-        else torch.empty(0, 48, device="cuda")
-    )
+    # Phase 3: Exchange gradient values atomically
+    recv_grads = torch.empty(n_recv, 48, device="cuda")
     ops = []
     if n_send > 0:
-        ops.append(dist.isend(grads_for_peer.contiguous(), dst=peer_rank))
+        ops.append(dist.P2POp(dist.isend, grads_for_peer.contiguous(), peer_rank))
     if n_recv > 0:
-        ops.append(dist.irecv(recv_grads, src=peer_rank))
-    for op in ops:
-        op.wait()
+        ops.append(dist.P2POp(dist.irecv, recv_grads, peer_rank))
+    if ops:
+        for r in dist.batch_isend_irecv(ops):
+            r.wait()
 
     # Accumulate received gradients into local param grads
     if n_recv > 0 and gaussians._parameters.grad is not None:
