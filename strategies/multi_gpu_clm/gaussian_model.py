@@ -188,8 +188,9 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         )  # (N_local, 45)
 
         # Store in CPU pinned buffer (like CLM)
+        # Move GPU tensors to CPU before writing to pinned buffer
         dims = [features_dc.shape[1], features_rest.shape[1]]
-        torch.cat((features_dc, features_rest), dim=1, out=self.parameters_buffer[:N_local])
+        torch.cat((features_dc.cpu(), features_rest.cpu()), dim=1, out=self.parameters_buffer[:N_local])
 
         self._parameters = nn.Parameter(
             self.parameters_buffer[:N_local].requires_grad_(True)
