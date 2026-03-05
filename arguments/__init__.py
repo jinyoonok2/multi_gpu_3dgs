@@ -86,6 +86,9 @@ class AuxiliaryParams(ParamGroup):
         # Sub-flags for multi_gpu (only meaningful when multi_gpu=True):
         self.enable_p2p_caching = False   # M1+M3: P2P point-to-point fetch (vs AllGather)
 
+        # --- Multi-GPU CLM (correct multi-GPU: CLM streaming + P2P cache sharing) ---
+        self.multi_gpu_clm = False  # Enable multi-GPU CLM mode
+
         # --- CLM Offload ---
         self.clm_offload = (
             False  # Enable final offload mode (required for pipelined_offload)
@@ -345,8 +348,8 @@ def find_latest_checkpoint(log_folder):
 def init_args(args):
 
     assert (
-        sum([args.clm_offload, args.naive_offload, args.no_offload, args.multi_gpu]) == 1
-    ), "Exactly one of clm_offload, naive_offload, no_offload, or multi_gpu must be True"
+        sum([args.clm_offload, args.naive_offload, args.no_offload, args.multi_gpu, args.multi_gpu_clm]) == 1
+    ), "Exactly one of clm_offload, naive_offload, no_offload, multi_gpu, or multi_gpu_clm must be True"
 
     # Logging are saved with where model is saved.
     args.log_folder = args.model_path

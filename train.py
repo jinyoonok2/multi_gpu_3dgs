@@ -65,6 +65,11 @@ from strategies.multi_gpu import (
     multi_gpu_train_one_batch,
     multi_gpu_eval_one_cam,
 )
+from strategies.multi_gpu_clm import (
+    GaussianModelMultiGPUCLM,
+    multi_gpu_clm_train_one_batch,
+    multi_gpu_clm_eval_one_cam,
+)
 
 from utils.general_utils import safe_state, prepare_output_and_logger
 import utils.general_utils as utils
@@ -94,7 +99,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     # For multi-GPU: override GPU device from torchrun's LOCAL_RANK and
     # initialize torch.distributed so collective ops (all_gather, etc.) work.
-    if args.multi_gpu:
+    if args.multi_gpu or args.multi_gpu_clm:
         local_rank = int(os.environ.get('LOCAL_RANK', 0))
         args.gpu = local_rank
         if not dist.is_initialized():
@@ -150,9 +155,25 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         gaussians = GaussianModelMultiGPU(sh_degree=dataset_args.sh_degree)
         utils.print_rank_0("Using GaussianModelMultiGPU (multi-GPU spatial partitioning)")
         log_file.write("Using GaussianModelMultiGPU (multi-GPU spatial partitioning)\n")
+    elif args.multi_gpu_clm:
+        # Auto-calculate prealloc_capacity for CPU pinned SH buffers
+        if args.prealloc_capacity == -1:
+            available_memory = psutil.virtual_memory().available
+            args.prealloc_capacity = (
+                int((available_memory * 0.7) / (48 * 4 * 4)) // 16 * 16
+            )
+            utils.print_rank_0(
+                f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians ({available_memory / (1024**3):.2f} GB available CPU memory)"
+            )
+            log_file.write(
+                f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians ({available_memory / (1024**3):.2f} GB available CPU memory)\n"
+            )
+        gaussians = GaussianModelMultiGPUCLM(sh_degree=dataset_args.sh_degree)
+        utils.print_rank_0("Using GaussianModelMultiGPUCLM (multi-GPU + CLM streaming)")
+        log_file.write("Using GaussianModelMultiGPUCLM (multi-GPU + CLM streaming)\n")
     else:
         raise ValueError(
-            f"Invalid offload configuration: naive_offload={args.naive_offload}, clm_offload={args.clm_offload}, no_offload={args.no_offload}"
+            f"Invalid offload configuration: naive_offload={args.naive_offload}, clm_offload={args.clm_offload}, no_offload={args.no_offload}, multi_gpu={args.multi_gpu}, multi_gpu_clm={args.multi_gpu_clm}"
         )
 
     with torch.no_grad():
@@ -489,6 +510,47 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             )
             log_file.write(log_string)
 
+        elif args.multi_gpu_clm:
+            # MULTI-GPU CLM: CLM streaming + multi-GPU P2P cache sharing
+            assert args.bsz > 1, "Multi-GPU CLM requires batch size > 1"
+            N = gaussians._xyz.shape[0]
+
+            losses, ordered_cams, sparsity = multi_gpu_clm_train_one_batch(
+                gaussians,
+                scene,
+                batched_cameras,
+                gaussians.parameters_grad_buffer,
+                background,
+                pipe_args,
+                comm_stream,
+                perm_generator,
+            )
+
+            batched_screenspace_pkg = {}
+
+            # Aggregate and log losses
+            timers.start("sync_loss_and_log")
+            batched_losses = torch.stack(losses)
+            batched_loss_cpu = batched_losses.cpu().numpy()
+
+            ema_loss_for_log = (
+                batched_loss_cpu.mean()
+                if ema_loss_for_log is None
+                else 0.6 * ema_loss_for_log + 0.4 * batched_loss_cpu.mean()
+            )
+
+            train_dataset.update_losses(batched_loss_cpu)
+
+            batched_loss_cpu = [round(loss, 6) for loss in batched_loss_cpu]
+            log_string = "iteration[{},{}), loss: {} sparsity: {} image: {}\n".format(
+                iteration,
+                iteration + args.bsz,
+                batched_loss_cpu,
+                sparsity,
+                [viewpoint_cam.image_name for viewpoint_cam in batched_cameras],
+            )
+            log_file.write(log_string)
+
         else:
             raise ValueError("Invalid configuration")
 
@@ -595,6 +657,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 iteration < opt_args.iterations
                 and not args.clm_offload
                 and not args.naive_offload
+                and not args.multi_gpu
+                and not args.multi_gpu_clm
             ):
                 timers.start("optimizer_step")
 
@@ -643,6 +707,11 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     timers.start("zero out grads")
                     gaussians.parameters_grad_buffer[:N, :].zero_()
                     timers.stop("zero out grads")
+
+            # Clear gradient buffer for multi_gpu_clm (optimizer step is inside engine)
+            if args.multi_gpu_clm:
+                N = gaussians._xyz.shape[0]
+                gaussians.parameters_grad_buffer[:N, :].zero_()
 
         # ------------------------------------------------------------------------
         # 2.12: Iteration cleanup
@@ -847,6 +916,15 @@ def training_report(
 
                     elif args.multi_gpu:
                         rendered_image = multi_gpu_eval_one_cam(
+                            camera=camera,
+                            gaussians=scene.gaussians,
+                            background=background,
+                            scene=scene,
+                        )
+                        batched_image.append(rendered_image)
+
+                    elif args.multi_gpu_clm:
+                        rendered_image = multi_gpu_clm_eval_one_cam(
                             camera=camera,
                             gaussians=scene.gaussians,
                             background=background,
