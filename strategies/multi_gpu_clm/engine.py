@@ -463,15 +463,27 @@ def multi_gpu_clm_train_one_batch(
 
     bsz = len(batched_cameras)
     N_local = gaussians._xyz.shape[0]
+    rank = gaussians.rank if hasattr(gaussians, 'rank') else 0
+
+    def _mem(tag):
+        torch.cuda.synchronize()
+        a = torch.cuda.memory_allocated() / 1024**3
+        r = torch.cuda.memory_reserved() / 1024**3
+        if rank == 0:
+            print(f"[Rank {rank}] MEM {tag}: alloc={a:.2f}G reserved={r:.2f}G", flush=True)
+
+    _mem("start_train")
 
     # ==================================================================
     # STAGE 1: Global visibility computation
     # ==================================================================
     with torch.no_grad():
         gaussians.sync_global_proxy()
+        _mem("after_sync_proxy")
         global_filters, global_scaling, global_rotation = calculate_filters_global(
             batched_cameras, gaussians
         )
+        _mem("after_calc_filters")
 
     # Precompute local/remote splits for all cameras
     splits = []
@@ -532,6 +544,10 @@ def multi_gpu_clm_train_one_batch(
     gaussians._scaling.grad = torch.zeros_like(gaussians._scaling)
     gaussians._rotation.grad = torch.zeros_like(gaussians._rotation)
 
+    _mem("after_grad_init")
+    torch.cuda.empty_cache()
+    _mem("after_empty_cache")
+
     default_stream = torch.cuda.current_stream()
 
     losses = []
@@ -559,6 +575,9 @@ def multi_gpu_clm_train_one_batch(
 
         n_local_vis = local_idx.shape[0]
         n_remote_vis = remote_global_idx.shape[0]
+
+        if micro_idx == 0:
+            _mem(f"cam0_start: n_local={n_local_vis} n_remote={n_remote_vis}")
 
         # ---------------------------------------------------------------
         # 4.1: Fetch local SH from CPU → GPU (CLM streaming)
@@ -611,6 +630,8 @@ def multi_gpu_clm_train_one_batch(
         # ---------------------------------------------------------------
         # Wait for CPU→GPU SH transfer to complete
         cpu2gpu_event.wait(default_stream)
+        if micro_idx == 0:
+            _mem("cam0_after_sh_fetch")
 
         # Local spatial params from GPU
         filtered_xyz = gaussians._xyz.detach()[local_idx].requires_grad_(True) if n_local_vis > 0 else torch.empty(0, 3, device="cuda")
@@ -645,6 +666,8 @@ def multi_gpu_clm_train_one_batch(
         # ---------------------------------------------------------------
         # 4.4: Forward pass
         # ---------------------------------------------------------------
+        if micro_idx == 0:
+            _mem(f"cam0_before_render: n_total={all_xyz.shape[0]}")
         torch.cuda.nvtx.range_push("forward_pass")
         filtered_shs = all_shs.requires_grad_(False)
 

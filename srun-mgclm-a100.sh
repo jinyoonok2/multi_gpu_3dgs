@@ -28,9 +28,8 @@ torchrun \
     --nproc_per_node=2 \
     --master_addr=localhost \
     --master_port=29500 \
-    train.py \
+    train_multi_gpu_clm.py \
     -s 'data/rubble-colmap' \
-    --multi_gpu_clm \
     --bsz 8 \
     --eval \
     -m output/rubble_a100_mgclm
