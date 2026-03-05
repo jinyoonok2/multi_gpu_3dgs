@@ -173,10 +173,9 @@ def _p2p_sh_cache_exchange(gaussians, peer_rank, my_need_local_indices,
         for r in dist.batch_isend_irecv(ops):
             r.wait()
 
-    # Phase 3: Gather SH for peer from our CPU-fetched cache and exchange
-    if n_peer_needs > 0 and my_cached_sh is not None and my_cached_sh.shape[0] > 0:
-        # Build index mapping: peer needs indices into our partition,
-        # our cache has some of those. Fetch remaining from CPU.
+    # Phase 3: Gather SH for peer from our cache (or CPU fallback) and exchange
+    if n_peer_needs > 0:
+        # _gather_sh_for_indices handles cache=None by falling back to CPU
         features_for_peer = _gather_sh_for_indices(
             gaussians, peer_need_indices, my_cached_sh, my_cached_local_indices
         )
