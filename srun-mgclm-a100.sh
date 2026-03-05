@@ -3,10 +3,11 @@
 #SBATCH --output=./slurm/slurm%j.out
 #SBATCH --error=./slurm/slurm%j.err
 #SBATCH --nodes=1
-#SBATCH --gres=gpu:nvidia_a100-pcie-40gb:2
+#SBATCH --gres=gpu:a100:2
 #SBATCH --mem=128G
 #SBATCH --cpus-per-task=16
 #SBATCH --partition=gpu
+#SBATCH --nodelist=cheetah04
 #SBATCH --time=1-00:00:00
 
 set -e
