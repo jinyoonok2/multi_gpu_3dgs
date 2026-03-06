@@ -686,6 +686,26 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         )
         self.prune_points(prune_filter)
 
+    def densify_and_prune(self, max_grad, min_opacity, extent, max_screen_size):
+        """Override base class to remove sentinel assertions for max_radii2D.
+        Our gsplat_add_densification_stats_exact_filter properly accumulates
+        max_radii2D, so big_points_vs pruning actually works."""
+        grads = self.xyz_gradient_accum / self.denom
+        grads[grads.isnan()] = 0.0
+
+        self.densify_and_clone(grads, max_grad, extent)
+        self.densify_and_split(grads, max_grad, extent)
+
+        prune_mask = (self.get_opacity < min_opacity).squeeze()
+        if max_screen_size:
+            big_points_vs = self.max_radii2D > max_screen_size
+            big_points_ws = self.get_scaling.max(dim=1).values > 0.1 * extent
+            prune_mask = torch.logical_or(
+                torch.logical_or(prune_mask, big_points_vs), big_points_ws
+            )
+        self.prune_points(prune_mask)
+        torch.cuda.empty_cache()
+
     def gsplat_add_densification_stats_exact_filter(
         self,
         viewspace_point_tensor_grad,
