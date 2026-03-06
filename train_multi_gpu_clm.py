@@ -85,19 +85,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # ----------------------------------------------------------------
     # 2. Create Gaussian model
     # ----------------------------------------------------------------
-    # Auto-calculate prealloc_capacity for CPU pinned SH buffers
+    # Auto-calculate prealloc_capacity for CPU pinned SH buffers.
+    # Each rank preallocates 4 pinned arrays of (capacity, 48) float32 = 768 bytes/Gaussian.
+    # Divide available memory by world_size so all ranks fit in physical RAM.
     if args.prealloc_capacity == -1:
         available_memory = psutil.virtual_memory().available
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
         args.prealloc_capacity = (
-            int((available_memory * 0.7) / (48 * 4 * 4)) // 16 * 16
+            int((available_memory * 0.7) / world_size / (48 * 4 * 4)) // 16 * 16
         )
         utils.print_rank_0(
             f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians "
-            f"({available_memory / (1024**3):.2f} GB available CPU memory)"
+            f"({available_memory / (1024**3):.2f} GB available CPU memory, "
+            f"{world_size} processes)"
         )
         log_file.write(
             f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians "
-            f"({available_memory / (1024**3):.2f} GB available CPU memory)\n"
+            f"({available_memory / (1024**3):.2f} GB available CPU memory, "
+            f"{world_size} processes)\n"
         )
 
     gaussians = GaussianModelMultiGPUCLM(sh_degree=dataset_args.sh_degree)
