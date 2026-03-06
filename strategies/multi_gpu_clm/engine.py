@@ -1,13 +1,13 @@
 """
-Multi-GPU CLM Engine — M1: Camera Parallelism
-==============================================
+Multi-GPU CLM Engine — M1 Camera Parallelism + M3 Collaborative SH Fetch
+=========================================================================
 
 Camera parallelism: each GPU renders the FULL scene for a subset of cameras.
 All Gaussians are replicated, so each GPU projects all of them. After all
 micro-batches, gradients are AllReduced across ranks so every GPU ends with
 identical parameter updates.
 
-Pipeline per batch:
+M1 Pipeline per batch:
   1. Split cameras: rank k gets cameras [k*C, (k+1)*C) where C = bsz/world_size
   2. Calculate visibility for this rank's cameras (all Gaussians)
   3. For each camera:
@@ -19,6 +19,16 @@ Pipeline per batch:
   5. AllReduce SH gradients via GPU staging (CPU→GPU→AllReduce→GPU→CPU)
   6. AllReduce densification stats so all ranks make identical decisions
   7. GPU Adam step (spatial), CPU Adam step (SH)
+
+M3 Enhancement (--enable_p2p_caching):
+  In step 3a, instead of each GPU independently fetching all its visible SH
+  from CPU, both GPUs coordinate:
+    i.   Exchange visibility indices via AllGather
+    ii.  Compute union of visible Gaussians
+    iii. Split the union — each GPU fetches ~half from CPU
+    iv.  AllGather fetched SH across GPUs
+    v.   Each GPU extracts its needed subset from the full union
+  Reduces per-GPU CPU→GPU bandwidth by ~50% at the cost of GPU↔GPU exchange.
 """
 
 import math
@@ -148,6 +158,107 @@ def _render_one_camera_clm(
 
 
 # =========================================================================
+# M3: Collaborative SH fetch (P2P caching)
+# =========================================================================
+
+def _collaborative_sh_fetch(
+    gaussians, this_filter, n_vis, comm_stream, grid_size, block_size,
+    rank, world_size,
+):
+    """
+    M3: Both GPUs exchange visibility, compute the union of needed Gaussians,
+    split the CPU→GPU fetch, and AllGather the results.  Each GPU does ~50%
+    of the CPU transfer; the other half arrives via fast GPU↔GPU AllGather.
+
+    Returns:
+        local_shs: (n_vis, 48) SH features for THIS GPU's visible Gaussians,
+                   ordered to match ``this_filter``.
+    """
+    device = this_filter.device
+    default_stream = torch.cuda.current_stream()
+
+    # ------------------------------------------------------------------
+    # 1. Exchange visibility filter sizes + indices via AllGather
+    # ------------------------------------------------------------------
+    local_n = torch.tensor([n_vis], dtype=torch.int64, device=device)
+    all_sizes = [torch.zeros(1, dtype=torch.int64, device=device)
+                 for _ in range(world_size)]
+    dist.all_gather(all_sizes, local_n)
+    sizes = [int(s.item()) for s in all_sizes]
+
+    max_n = max(sizes)
+    padded_filter = torch.zeros(max_n, dtype=this_filter.dtype, device=device)
+    padded_filter[:n_vis] = this_filter
+    all_padded = [torch.empty(max_n, dtype=this_filter.dtype, device=device)
+                  for _ in range(world_size)]
+    dist.all_gather(all_padded, padded_filter)
+    all_filters = [all_padded[r][:sizes[r]] for r in range(world_size)]
+
+    # ------------------------------------------------------------------
+    # 2. Compute sorted union of visible indices across all GPUs
+    # ------------------------------------------------------------------
+    combined = torch.cat(all_filters)
+    union_indices, inverse_map = torch.unique(
+        combined, sorted=True, return_inverse=True,
+    )
+    n_union = union_indices.shape[0]
+
+    # ------------------------------------------------------------------
+    # 3. Split the union evenly across GPUs for cooperative CPU fetch
+    # ------------------------------------------------------------------
+    chunk_size = (n_union + world_size - 1) // world_size  # ceil division
+    my_start = rank * chunk_size
+    my_end = min(my_start + chunk_size, n_union)
+    my_portion = union_indices[my_start:my_end]
+    my_portion_len = my_end - my_start
+
+    # ------------------------------------------------------------------
+    # 4. Each GPU fetches its portion of SH from CPU (CLM kernel)
+    # ------------------------------------------------------------------
+    my_portion_shs = torch.empty(my_portion_len, 48, device=device)
+    with torch.cuda.stream(comm_stream), torch.no_grad():
+        send_shs2gpu_stream(
+            my_portion_shs,
+            gaussians._parameters,
+            my_portion,
+            grid_size,
+            block_size,
+        )
+        fetch_event = torch.cuda.Event()
+        fetch_event.record(comm_stream)
+    fetch_event.wait(default_stream)
+
+    # ------------------------------------------------------------------
+    # 5. AllGather fetched SH across GPUs
+    # ------------------------------------------------------------------
+    # Pad to uniform chunk_size for AllGather
+    my_padded_shs = torch.zeros(chunk_size, 48, device=device)
+    my_padded_shs[:my_portion_len] = my_portion_shs
+    all_shs = [torch.empty(chunk_size, 48, device=device)
+               for _ in range(world_size)]
+    dist.all_gather(all_shs, my_padded_shs)
+
+    # Trim padding and concatenate to reconstruct full union SH
+    trimmed = []
+    for r in range(world_size):
+        r_start = r * chunk_size
+        r_end = min(r_start + chunk_size, n_union)
+        trimmed.append(all_shs[r][:r_end - r_start])
+    union_shs = torch.cat(trimmed, dim=0)  # (n_union, 48)
+
+    # ------------------------------------------------------------------
+    # 6. Extract this GPU's needed SH from the union
+    # ------------------------------------------------------------------
+    # inverse_map corresponds to combined = cat(all_filters)
+    # This rank's entries are at offset sum(sizes[:rank]) .. +n_vis
+    offset = sum(sizes[:rank])
+    my_inverse = inverse_map[offset:offset + n_vis]
+    local_shs = union_shs[my_inverse]  # (n_vis, 48)
+
+    return local_shs
+
+
+# =========================================================================
 # Main training entry point — M1 Camera Parallelism
 # =========================================================================
 
@@ -227,24 +338,28 @@ def multi_gpu_clm_train_one_batch(
             continue
 
         # ---------------------------------------------------------------
-        # 4.1: Fetch visible SH from CPU → GPU (CLM streaming)
+        # 4.1: Fetch visible SH from CPU → GPU
         # ---------------------------------------------------------------
-        with torch.cuda.stream(comm_stream), torch.no_grad():
-            local_shs = torch.empty(n_vis, 48, device="cuda")
-            send_shs2gpu_stream(
-                local_shs,
-                gaussians._parameters,
-                this_filter,
-                grid_size,
-                block_size,
+        if args.enable_p2p_caching and world_size > 1:
+            # M3: Collaborative fetch — split CPU work, AllGather results
+            local_shs = _collaborative_sh_fetch(
+                gaussians, this_filter, n_vis, comm_stream,
+                grid_size, block_size, rank, world_size,
             )
-            cpu2gpu_event = torch.cuda.Event()
-            cpu2gpu_event.record(comm_stream)
-
-        # ---------------------------------------------------------------
-        # 4.2: Assemble filtered features for rendering
-        # ---------------------------------------------------------------
-        cpu2gpu_event.wait(default_stream)
+        else:
+            # M1: Independent fetch — each GPU fetches its own visible SH
+            with torch.cuda.stream(comm_stream), torch.no_grad():
+                local_shs = torch.empty(n_vis, 48, device="cuda")
+                send_shs2gpu_stream(
+                    local_shs,
+                    gaussians._parameters,
+                    this_filter,
+                    grid_size,
+                    block_size,
+                )
+                cpu2gpu_event = torch.cuda.Event()
+                cpu2gpu_event.record(comm_stream)
+            cpu2gpu_event.wait(default_stream)
 
         filtered_xyz = gaussians._xyz.detach()[this_filter].requires_grad_(True)
         _filtered_opacity = gaussians._opacity.detach()[this_filter].requires_grad_(True)
@@ -440,7 +555,8 @@ def multi_gpu_clm_train_one_batch(
             scale=1.0 / bsz,
         )
 
-    utils.memory_report("after optimizer step (multi_gpu_clm M1)")
+    mode_tag = "M1+M3" if args.enable_p2p_caching else "M1"
+    utils.memory_report(f"after optimizer step (multi_gpu_clm {mode_tag})")
     torch.cuda.synchronize()
 
     # ==================================================================

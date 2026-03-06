@@ -1,10 +1,8 @@
 #!/bin/bash
-# Multi-GPU CLM (M1 camera parallelism): auto-detects allocated GPUs.
-# Usage: sbatch --gres=gpu:TYPE:COUNT run_mgclm.sh
-#   Examples:
-#     sbatch --gres=gpu:a40:2 run_mgclm.sh
-#     sbatch --gres=gpu:a100:2 run_mgclm.sh
-#     sbatch --gres=gpu:nvidia_h100_nvl:2 run_mgclm.sh
+# Multi-GPU CLM: auto-detects allocated GPUs.
+# Usage:
+#   sbatch --gres=gpu:a40:2 run_mgclm.sh           # M1 only
+#   sbatch --gres=gpu:a40:2 run_mgclm.sh --p2p      # M1+M3 (collaborative SH fetch)
 #
 #SBATCH --output=./slurm/slurm%j.out
 #SBATCH --error=./slurm/slurm%j.err
@@ -15,6 +13,14 @@
 #SBATCH --time=1-00:00:00
 
 set -e
+
+# Parse script arguments
+P2P_FLAG=""
+MODE_TAG="m1"
+if [[ "$1" == "--p2p" ]]; then
+    P2P_FLAG="--enable_p2p_caching"
+    MODE_TAG="m1m3"
+fi
 
 module purge
 module load miniforge
@@ -36,10 +42,11 @@ export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 # Derive a tag from GPU name for output directory
 GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr ' ' '_' | tr '[:upper:]' '[:lower:]')
 
-echo "=== Multi-GPU CLM (M1) ==="
+echo "=== Multi-GPU CLM (${MODE_TAG}) ==="
 echo "GPUs detected: ${NUM_GPUS}"
+echo "P2P caching: ${P2P_FLAG:-disabled}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
-echo "=========================="
+echo "=============================="
 
 torchrun \
     --nproc_per_node="${NUM_GPUS}" \
@@ -49,4 +56,5 @@ torchrun \
     -s 'data/rubble-colmap' \
     --bsz 8 \
     --eval \
-    -m "output/rubble_${GPU_NAME}_x${NUM_GPUS}_mgclm"
+    ${P2P_FLAG} \
+    -m "output/rubble_${GPU_NAME}_x${NUM_GPUS}_${MODE_TAG}"
