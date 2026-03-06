@@ -7,7 +7,7 @@ Format: one entry per development session, newest at the top.
 
 ## [2026-03-06] — Redesign: Camera Parallelism (M1 → M3 → M2)
 
-**Status:** PLANNED — Implementation starts today
+**Status:** M1 IMPLEMENTED, M3 IMPLEMENTED, M2 NOT STARTED
 
 ---
 
@@ -100,13 +100,59 @@ Training Loop (batch of 8 cameras):
 - `strategies/multi_gpu_clm/engine.py` — Rewrite for camera parallelism:
   M1 (basic), M3 (P2P cache), M2 (stream overlap)
 - `train_multi_gpu_clm.py` — Update training loop for camera-split dispatch
-- `srun-mgclm-a40.sh`, `srun-mgclm-a100.sh` — Update as needed
+- `run_mgclm.sh` — Dynamic GPU selection (a40/a100), supports `--p2p` flag
+- `run_clm_baseline.sh` — Dynamic GPU selection (a40/a100) for single-GPU CLM
 
 ### Evaluation Plan
 
 - Compare PSNR and training time across: CLM baseline (1 GPU), M1, M1+M3, M1+M3+M2
 - CLM baseline PSNR: 24.997 on A100 (job 5567867)
 - Dataset: rubble-colmap (1,399,033 Gaussians, 1,678 cameras, 4591×3436)
+
+---
+
+### Implementation Progress
+
+#### Commit `9ce4013` — M1: Camera Parallelism
+- Rewrote `gaussian_model.py` (845→715 lines): removed all spatial partitioning
+  (`_build_global_proxy`, `get_local_and_remote_indices`, partition logic),
+  ALL Gaussians replicated on every GPU
+- Rewrote `engine.py` (893→493 lines): camera split across GPUs, each renders
+  full scene, AllReduce spatial+SH grads+densification stats
+- Implemented real `gsplat_add_densification_stats_exact_filter` (was a no-op stub)
+
+#### Commit `eea103e` — Fix OOM
+- `prealloc_capacity` auto-calculation didn't divide by `world_size`
+- Each process tried to allocate ~90 GB pinned memory (total 180 GB vs 125 GB RAM)
+- Fixed by dividing available memory by `world_size` before computing capacity
+
+#### Commit `8f1f6d7` — Shell Script Cleanup
+- Replaced 4 hardcoded GPU-specific scripts with 2 dynamic scripts
+- `run_mgclm.sh` and `run_clm_baseline.sh` accept `a40` or `a100` argument
+
+#### Commit `406314c` — M3: Collaborative SH Fetch
+- Added `_collaborative_sh_fetch()` helper in `engine.py`
+- Controlled by `--enable_p2p_caching` flag (existing CLI arg)
+- When enabled: GPUs exchange visibility, compute union, split CPU fetch,
+  AllGather results. Each GPU does ~50% of CPU→GPU transfer.
+- When disabled: M1 behavior (each GPU fetches independently)
+
+#### Commit `5158466` — Fix Densification Bug
+- Base class had sentinel assertions (`max_radii2D is all 0`) documenting a
+  known bug in the original CLM code
+- Our implementation properly accumulates `max_radii2D`, triggering the sentinel
+- Override `densify_and_prune` in our model to remove the bogus assertions
+
+#### Commit `f6ea0b3` — Shell Script Improvement
+- Scripts auto-resubmit with correct `--gres` when user runs `sbatch run_mgclm.sh a40`
+- No need to manually specify `--gres=gpu:a40:2` on command line
+
+### Current Job Status (as of 2026-03-06)
+
+| Job | Mode | GPU | Status |
+|-----|------|-----|--------|
+| 5590916 | M1 | 2× A40 | Running |
+| 5590917 | M1+M3 | 2× A40 | Pending (Priority) |
 
 ---
 
@@ -258,10 +304,10 @@ To add a new strategy later: create a new `*_strategy.py`, import it here, add a
 | Flag | Strategy | GPUs | Description |
 |---|---|---|---|
 | `--no_offload` | `GaussianModelNoOffload` | 1 | All Gaussians on GPU, no offload |
-| `--clm_offload` | `GaussianModelCLMOffload` | 1 | CLM CPU offload |
+| `--clm_offload` | `GaussianModelCLMOffload` | 1 | CLM CPU offload (baseline) |
 | `--naive_offload` | `GaussianModelNaiveOffload` | 1 | Naive CPU offload |
-| `--multi_gpu` | `GaussianModelMultiGPU` + M3Strategy | 2+ | Spatial partitioning + AllGather |
-| `--multi_gpu --enable_p2p_caching` | `GaussianModelMultiGPU` + M1M3Strategy | 2+ | Spatial partitioning + P2P |
+| `--multi_gpu_clm` | `GaussianModelMultiGPUCLM` | 2 | M1: Camera parallelism, replicated Gaussians |
+| `--multi_gpu_clm --enable_p2p_caching` | `GaussianModelMultiGPUCLM` | 2 | M1+M3: Camera parallelism + collaborative SH fetch |
 
 ---
 
