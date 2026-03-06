@@ -1,10 +1,10 @@
 #
 # Standalone training script for multi_gpu_clm strategy.
 #
-# This is a clean, self-contained version that only handles:
-#   - Multi-GPU spatial partitioning with CLM-style CPU↔GPU SH streaming
-#   - P2P SH cache sharing between GPUs
-#   - CPU Adam for SH, GPU Adam for spatial params
+# Camera parallelism: every GPU holds ALL Gaussians (replicated).
+# Each GPU renders a subset of cameras per batch, then AllReduces gradients.
+#
+# M1: Basic camera parallelism with AllReduced gradients.
 #
 # Usage:
 #   torchrun --nproc_per_node=2 train_multi_gpu_clm.py -s <data> -m <output> --bsz 8 --eval
@@ -58,8 +58,8 @@ from densification import gsplat_densification
 
 def training(dataset_args, opt_args, pipe_args, args, log_file):
     """
-    Multi-GPU CLM training loop.
-    Spatial params partitioned across GPUs, SH streamed from CPU pinned memory.
+    Multi-GPU CLM training loop (M1: Camera Parallelism).
+    All Gaussians replicated on every GPU. Each GPU renders a subset of cameras.
     """
 
     # ----------------------------------------------------------------

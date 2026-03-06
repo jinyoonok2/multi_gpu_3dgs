@@ -1,31 +1,24 @@
 """
-Multi-GPU CLM Engine
-====================
+Multi-GPU CLM Engine — M1: Camera Parallelism
+==============================================
 
-Training engine that preserves CLM's CPU↔GPU streaming for SH features
-while adding multi-GPU parallelism with P2P cache sharing.
+Camera parallelism: each GPU renders the FULL scene for a subset of cameras.
+All Gaussians are replicated, so each GPU projects all of them. After all
+micro-batches, gradients are AllReduced across ranks so every GPU ends with
+identical parameter updates.
 
-Architecture:
-  1. Global visibility: All GPUs compute which Gaussians are visible
-     using the replicated lightweight proxy (xyz + opacity).
-  2. Camera assignment: Cameras in the batch are distributed across GPUs.
-     Each GPU processes bsz/world_size cameras.
-  3. SH streaming (CLM): For each camera, the GPU fetches visible SH
-     features from CPU pinned memory on a comm_stream, overlapped with
-     computation on the default stream.
-  4. P2P cache sharing: When multiple GPUs need overlapping SH blocks,
-     they exchange via NCCL P2P instead of redundant CPU fetches.
-  5. Gradient flow:
-     - Spatial params: local gradients update directly on GPU.
-       For remote Gaussians, gradients are sent to the owning rank
-       via P2P and accumulated.
-     - SH gradients: offloaded to CPU, processed by CPU Adam thread
-       (same as CLM baseline).
-
-Key difference from old multi_gpu strategy:
-  The old design put SH in VRAM — defeating CLM's purpose.
-  This design keeps SH on CPU, making multi-GPU useful for scenes
-  that genuinely exceed single-GPU VRAM.
+Pipeline per batch:
+  1. Split cameras: rank k gets cameras [k*C, (k+1)*C) where C = bsz/world_size
+  2. Calculate visibility for this rank's cameras (all Gaussians)
+  3. For each camera:
+     a. Fetch visible SH from CPU pinned memory (CLM streaming)
+     b. Forward: project, SH→color, rasterize
+     c. Backward: compute gradients
+     d. Scatter spatial grads; offload SH grads to CPU buffer
+  4. AllReduce spatial gradients on GPU
+  5. AllReduce SH gradients via GPU staging (CPU→GPU→AllReduce→GPU→CPU)
+  6. AllReduce densification stats so all ranks make identical decisions
+  7. GPU Adam step (spatial), CPU Adam step (SH)
 """
 
 import math
@@ -38,8 +31,6 @@ import clm_kernels
 from clm_kernels import (
     send_shs2gpu_stream,
     send_shs2cpu_grad_buffer_stream,
-    send_shs2gpu_stream_retention,
-    send_shs2cpu_grad_buffer_stream_retention,
     spherical_harmonics_bwd_inplace,
 )
 from gsplat import (
@@ -56,336 +47,7 @@ from densification import update_densification_stats_offload_accum_grads
 
 
 # =========================================================================
-# Visibility using global proxy (reused from multi_gpu base_strategy)
-# =========================================================================
-
-def calculate_filters_global(batched_cameras, gaussians):
-    """
-    Compute visibility using the lightweight global proxy.
-    Returns per-camera GLOBAL Gaussian indices + gathered scaling/rotation.
-    """
-    args = utils.get_args()
-    image_width = int(utils.get_img_width())
-    image_height = int(utils.get_img_height())
-
-    with torch.no_grad():
-        Ks = []
-        viewmats = []
-        for camera in batched_cameras:
-            K = camera.create_k_on_gpu()
-            viewmat = camera.world_view_transform.transpose(0, 1)
-            Ks.append(K)
-            viewmats.append(viewmat)
-        batched_Ks = torch.stack(Ks)
-        batched_viewmats = torch.stack(viewmats)
-
-        # Gather global scaling/rotation for projection
-        scaling = gaussians.get_scaling
-        rotation = gaussians.get_rotation
-
-        if dist.is_initialized() and gaussians.world_size > 1:
-            all_scaling = [
-                torch.zeros(s, 3, device="cuda")
-                for s in gaussians.partition_sizes
-            ]
-            all_rotation = [
-                torch.zeros(s, 4, device="cuda")
-                for s in gaussians.partition_sizes
-            ]
-            dist.all_gather(all_scaling, scaling.contiguous())
-            dist.all_gather(all_rotation, rotation.contiguous())
-            global_scaling = torch.cat(all_scaling, dim=0)
-            global_rotation = torch.cat(all_rotation, dim=0)
-        else:
-            global_scaling = scaling
-            global_rotation = rotation
-
-        proj_results = fully_fused_projection(
-            means=gaussians.global_xyz,
-            covars=None,
-            quats=global_rotation,
-            scales=global_scaling,
-            viewmats=batched_viewmats,
-            Ks=batched_Ks,
-            radius_clip=args.radius_clip,
-            width=image_width,
-            height=image_height,
-            packed=True,
-        )
-
-        (camera_ids, gaussian_ids, _, _, _, _, _) = proj_results
-        output, counts = torch.unique_consecutive(camera_ids, return_counts=True)
-        counts_cpu = counts.cpu().numpy().tolist()
-        gaussian_ids_per_camera = torch.split(gaussian_ids, counts_cpu)
-
-    return gaussian_ids_per_camera, global_scaling, global_rotation
-
-
-def calculate_filters_local(batched_cameras, gaussians):
-    """
-    Compute local-only visibility: each GPU projects its OWN partition.
-    No AllGather needed — avoids the memory cost of global projection.
-    Returns per-camera LOCAL Gaussian indices.
-    """
-    args = utils.get_args()
-    image_width = int(utils.get_img_width())
-    image_height = int(utils.get_img_height())
-
-    with torch.no_grad():
-        Ks = []
-        viewmats = []
-        for camera in batched_cameras:
-            K = camera.create_k_on_gpu()
-            viewmat = camera.world_view_transform.transpose(0, 1)
-            Ks.append(K)
-            viewmats.append(viewmat)
-        batched_Ks = torch.stack(Ks)
-        batched_viewmats = torch.stack(viewmats)
-
-        # Project LOCAL Gaussians only — no AllGather needed
-        proj_results = fully_fused_projection(
-            means=gaussians._xyz.detach(),
-            covars=None,
-            quats=gaussians.get_rotation,
-            scales=gaussians.get_scaling,
-            viewmats=batched_viewmats,
-            Ks=batched_Ks,
-            radius_clip=args.radius_clip,
-            width=image_width,
-            height=image_height,
-            packed=True,
-        )
-
-        (camera_ids, gaussian_ids, _, _, _, _, _) = proj_results
-        n_cams = len(batched_cameras)
-
-        if camera_ids.numel() == 0:
-            return [torch.empty(0, dtype=torch.long, device="cuda")] * n_cams
-
-        output, counts = torch.unique_consecutive(camera_ids, return_counts=True)
-        counts_cpu = counts.cpu().numpy().tolist()
-        id_splits = torch.split(gaussian_ids, counts_cpu)
-
-        # Map camera_id → split index
-        cam_to_split = {}
-        for i, cid in enumerate(output.cpu().numpy().tolist()):
-            cam_to_split[int(cid)] = i
-
-        result = []
-        for cam_idx in range(n_cams):
-            if cam_idx in cam_to_split:
-                result.append(id_splits[cam_to_split[cam_idx]])
-            else:
-                result.append(torch.empty(0, dtype=torch.long, device="cuda"))
-
-    return result
-
-
-# =========================================================================
-# P2P SH cache sharing helpers
-# =========================================================================
-
-def _p2p_sh_cache_exchange(gaussians, peer_rank, my_need_local_indices,
-                           my_cached_sh, my_cached_local_indices):
-    """
-    Exchange SH features with a peer GPU.
-
-    Instead of both GPUs fetching overlapping SH from CPU, check if the
-    peer already has what we need, and exchange via NCCL P2P.
-
-    Protocol:
-      1. Exchange need counts
-      2. Exchange need indices (local indices on the peer's partition)
-      3. Peer gathers from its SH cache → sends; we receive
-
-    Args:
-        gaussians: GaussianModelMultiGPUCLM
-        peer_rank: rank of the peer GPU
-        my_need_local_indices: local indices (on peer's partition) that I need
-        my_cached_sh: (M, 48) SH features I've already fetched from CPU
-        my_cached_local_indices: local indices corresponding to my_cached_sh
-
-    Returns:
-        received_sh: (n_need, 48) SH features from peer
-    """
-    n_need = my_need_local_indices.shape[0]
-
-    # Phase 1: Exchange counts
-    my_count = torch.tensor([n_need], dtype=torch.long, device="cuda")
-    peer_count = torch.empty(1, dtype=torch.long, device="cuda")
-    for r in dist.batch_isend_irecv([
-        dist.P2POp(dist.isend, my_count, peer_rank),
-        dist.P2POp(dist.irecv, peer_count, peer_rank),
-    ]):
-        r.wait()
-    n_peer_needs = int(peer_count.item())
-
-    # Phase 2: Exchange index lists
-    peer_need_indices = torch.empty(
-        n_peer_needs, dtype=my_need_local_indices.dtype, device="cuda"
-    )
-    ops = []
-    if n_need > 0:
-        ops.append(dist.P2POp(dist.isend, my_need_local_indices.contiguous(), peer_rank))
-    if n_peer_needs > 0:
-        ops.append(dist.P2POp(dist.irecv, peer_need_indices, peer_rank))
-    if ops:
-        for r in dist.batch_isend_irecv(ops):
-            r.wait()
-
-    # Phase 3: Gather SH for peer from our cache (or CPU fallback) and exchange
-    if n_peer_needs > 0:
-        # _gather_sh_for_indices handles cache=None by falling back to CPU
-        features_for_peer = _gather_sh_for_indices(
-            gaussians, peer_need_indices, my_cached_sh, my_cached_local_indices
-        )
-    else:
-        features_for_peer = torch.empty(0, 48, device="cuda")
-
-    received_sh = torch.empty(n_need, 48, device="cuda") if n_need > 0 else torch.empty(0, 48, device="cuda")
-    ops = []
-    if n_peer_needs > 0:
-        ops.append(dist.P2POp(dist.isend, features_for_peer.contiguous(), peer_rank))
-    if n_need > 0:
-        ops.append(dist.P2POp(dist.irecv, received_sh, peer_rank))
-    if ops:
-        for r in dist.batch_isend_irecv(ops):
-            r.wait()
-
-    return received_sh
-
-
-def _gather_sh_for_indices(gaussians, local_indices, cached_sh, cached_local_indices):
-    """
-    Gather SH features for given local indices.
-    First check the GPU cache, fallback to CPU pinned memory for misses.
-    """
-    n = local_indices.shape[0]
-    result = torch.empty(n, 48, device="cuda")
-
-    if cached_sh is not None and cached_sh.shape[0] > 0:
-        # Build reverse index: local_idx → position in cache
-        max_idx = max(
-            cached_local_indices.max().item() if cached_local_indices.shape[0] > 0 else 0,
-            local_indices.max().item() if n > 0 else 0,
-        ) + 1
-        reverse_map = torch.full((max_idx,), -1, dtype=torch.long, device="cuda")
-        reverse_map[cached_local_indices] = torch.arange(
-            cached_local_indices.shape[0], device="cuda"
-        )
-
-        cache_positions = reverse_map[local_indices]
-        cache_hit = cache_positions >= 0
-        cache_miss = ~cache_hit
-
-        # Cache hits: gather from GPU cache
-        if cache_hit.any():
-            hit_positions = cache_positions[cache_hit]
-            result[cache_hit] = cached_sh[hit_positions]
-
-        # Cache misses: fetch from CPU
-        if cache_miss.any():
-            miss_local_indices = local_indices[cache_miss]
-            # Fetch from CPU pinned memory
-            miss_sh = gaussians._parameters[miss_local_indices.cpu()].cuda()
-            result[cache_miss] = miss_sh
-    else:
-        # No cache — all from CPU
-        result = gaussians._parameters[local_indices.cpu()].cuda()
-
-    return result
-
-
-# =========================================================================
-# P2P gradient exchange for remote spatial params
-# =========================================================================
-
-def _p2p_spatial_gradient_exchange(peer_rank, grads_for_peer, indices_for_peer,
-                                   my_local_n, device="cuda"):
-    """
-    Exchange spatial gradients with a peer for remote Gaussians.
-    Send gradients I computed for Gaussians owned by peer.
-    Receive gradients peer computed for Gaussians I own.
-    Returns (received_grads, received_indices).
-    """
-    n_send = grads_for_peer.shape[0]
-
-    # Phase 1: Exchange counts
-    my_count = torch.tensor([n_send], dtype=torch.long, device=device)
-    peer_count = torch.empty(1, dtype=torch.long, device=device)
-    for r in dist.batch_isend_irecv([
-        dist.P2POp(dist.isend, my_count, peer_rank),
-        dist.P2POp(dist.irecv, peer_count, peer_rank),
-    ]):
-        r.wait()
-    n_recv = int(peer_count.item())
-
-    grad_dim = grads_for_peer.shape[1] if n_send > 0 else 1
-
-    # Phase 2: Exchange indices
-    recv_indices = torch.empty(n_recv, dtype=torch.long, device=device)
-    ops = []
-    if n_send > 0:
-        ops.append(dist.P2POp(dist.isend, indices_for_peer.contiguous(), peer_rank))
-    if n_recv > 0:
-        ops.append(dist.P2POp(dist.irecv, recv_indices, peer_rank))
-    if ops:
-        for r in dist.batch_isend_irecv(ops):
-            r.wait()
-
-    # Phase 3: Exchange gradient values
-    recv_grads = torch.empty(n_recv, grad_dim, device=device)
-    ops = []
-    if n_send > 0:
-        ops.append(dist.P2POp(dist.isend, grads_for_peer.contiguous(), peer_rank))
-    if n_recv > 0:
-        ops.append(dist.P2POp(dist.irecv, recv_grads, peer_rank))
-    if ops:
-        for r in dist.batch_isend_irecv(ops):
-            r.wait()
-
-    return recv_grads, recv_indices
-
-
-# =========================================================================
-# CPU Adam thread (reused from CLM)
-# =========================================================================
-
-def cpuadam_thread(
-    bsz,
-    n_gaussians,
-    signal_tensor_pinned,
-    finish_indices_filters,
-    cpu_adam,
-    parameters,
-    parameters_grad,
-    iteration,
-    args,
-):
-    """Background CPU Adam optimizer thread — identical to CLM's."""
-    torch.cuda.nvtx.range_push(
-        f"cpuadam thread for iter: [{iteration},{iteration+bsz})"
-    )
-
-    version = 3  # inplace_zero_grad is true
-    parameters.grad = parameters_grad
-    if not args.stop_update_param:
-        torch.cuda.nvtx.range_push("cpu_adam.sparse_step()")
-        cpu_adam.batched_sparse_step(
-            batch_size=bsz,
-            batched_sparse_indices=finish_indices_filters,
-            signal_tensor_pinned=signal_tensor_pinned,
-            version=version,
-            scale=1.0 / bsz,
-            sparse_adam=args.sparse_adam,
-        )
-        torch.cuda.nvtx.range_pop()
-
-    torch.cuda.nvtx.range_pop()
-
-
-# =========================================================================
-# Render helper (for single camera)
+# Render helper (single camera, CLM-style inplace SH backward)
 # =========================================================================
 
 def _render_one_camera_clm(
@@ -427,7 +89,7 @@ def _render_one_camera_clm(
     )
     batched_means2D.retain_grad()
 
-    # Spherical harmonics → color (with detach/recompute for CLM backward)
+    # Spherical harmonics → color
     sh_degree = gaussians.active_sh_degree
     camtoworlds = camera.camtoworlds
     dirs = filtered_xyz[None, :, :] - camtoworlds[:, None, :3, 3]
@@ -486,7 +148,7 @@ def _render_one_camera_clm(
 
 
 # =========================================================================
-# Main training entry point
+# Main training entry point — M1 Camera Parallelism
 # =========================================================================
 
 def multi_gpu_clm_train_one_batch(
@@ -500,84 +162,44 @@ def multi_gpu_clm_train_one_batch(
     perm_generator,
 ):
     """
-    Multi-GPU CLM training loop — local-only rendering.
+    M1 Camera Parallelism training loop.
 
-    Each GPU renders only its own spatial partition's visible Gaussians.
-    This avoids the VRAM overhead of gathering remote features while
-    preserving CLM's CPU↔GPU SH streaming for memory efficiency.
-
-    Pipeline per micro-batch:
-      1. Project local Gaussians → determine visibility per camera
-      2. Fetch visible local SH from CPU (on comm_stream, overlapped)
-      3. Forward: project, SH→color, rasterize (local Gaussians only)
-      4. Backward: compute gradients
-      5. Scatter spatial grads; offload SH grads to CPU
+    Each GPU renders the FULL scene for its subset of cameras.
+    After all micro-batches, gradients are AllReduced for correctness.
     """
     args = utils.get_args()
     iteration = utils.get_cur_iter()
     log_file = utils.get_log_file()
 
     bsz = len(batched_cameras)
-    N_local = gaussians._xyz.shape[0]
-    rank = gaussians.rank if hasattr(gaussians, 'rank') else 0
-
-    def _mem(tag):
-        torch.cuda.synchronize()
-        a = torch.cuda.memory_allocated() / 1024**3
-        r = torch.cuda.memory_reserved() / 1024**3
-        if rank == 0:
-            print(f"[Rank {rank}] MEM {tag}: alloc={a:.2f}G reserved={r:.2f}G", flush=True)
-
-    _mem("start_train")
+    N = gaussians._xyz.shape[0]
+    rank = gaussians.rank if hasattr(gaussians, "rank") else 0
+    world_size = gaussians.world_size if hasattr(gaussians, "world_size") else 1
 
     # ==================================================================
-    # STAGE 1: Local visibility computation (no AllGather needed)
+    # STAGE 1: Split cameras across GPUs
+    # ==================================================================
+    assert bsz % world_size == 0, (
+        f"bsz={bsz} must be divisible by world_size={world_size}"
+    )
+    cams_per_gpu = bsz // world_size
+    my_start = rank * cams_per_gpu
+    my_end = my_start + cams_per_gpu
+    my_cameras = batched_cameras[my_start:my_end]
+
+    # ==================================================================
+    # STAGE 2: Calculate visibility for MY cameras
     # ==================================================================
     with torch.no_grad():
-        _mem("before_calc_filters")
-        local_visible_per_cam = calculate_filters_local(batched_cameras, gaussians)
-        _mem("after_calc_filters")
+        xyz_gpu = gaussians.get_xyz
+        opacity_gpu = gaussians.get_opacity
+        scaling_gpu = gaussians.get_scaling
+        rotation_gpu = gaussians.get_rotation
 
-    # ==================================================================
-    # STAGE 2: CPU Adam thread initialization (like CLM)
-    # ==================================================================
-    if not hasattr(gaussians, "signal_tensor_pinned"):
-        gaussians.signal_tensor_pinned = torch.zeros(
-            bsz, dtype=torch.int32, device="cpu", pin_memory=True
+        filters, _, _ = calculate_filters(
+            my_cameras, xyz_gpu, opacity_gpu, scaling_gpu, rotation_gpu
         )
-    else:
-        gaussians.signal_tensor_pinned.zero_()
-    signal_tensor_pinned = gaussians.signal_tensor_pinned
-
-    # Build finish_indices_filters for CPU Adam
-    # In multi-GPU CLM, each GPU processes all cameras but only updates
-    # its own local SH partition. The finish indices track which local
-    # Gaussians were visible across which micro-batches.
-    local_filters = list(local_visible_per_cam)
-
-    # Build simple finish_indices_filters: which local Gaussians finished
-    # at each micro-batch boundary (for CPU Adam sparse step)
-    # Simplified: all visible local Gaussians are "finished" after each camera
-    finish_indices_filters = _build_finish_indices(local_filters, N_local, bsz)
-
-    torch.cuda.synchronize()
-
-    microbatch_idx = 0
-    cpuadam_worker = threading.Thread(
-        target=cpuadam_thread,
-        args=(
-            bsz,
-            N_local,
-            signal_tensor_pinned,
-            finish_indices_filters,
-            gaussians.optimizer.cpu_adam,
-            gaussians._parameters,
-            parameters_grad_buffer[:N_local, :],
-            iteration,
-            args,
-        ),
-    )
-    cpuadam_worker.start()
+        del opacity_gpu, scaling_gpu, rotation_gpu
 
     # ==================================================================
     # STAGE 3: Initialize gradient accumulators
@@ -587,45 +209,32 @@ def multi_gpu_clm_train_one_batch(
     gaussians._scaling.grad = torch.zeros_like(gaussians._scaling)
     gaussians._rotation.grad = torch.zeros_like(gaussians._rotation)
 
-    _mem("after_grad_init")
-    torch.cuda.empty_cache()
-    _mem("after_empty_cache")
-
     default_stream = torch.cuda.current_stream()
-
-    losses = []
     grid_size, block_size = args.grid_size_H, 256
+    losses = []
 
     # ==================================================================
-    # STAGE 4: Main micro-batch training loop (local-only rendering)
+    # STAGE 4: Main micro-batch loop (my cameras only)
     # ==================================================================
-    for micro_idx in range(bsz):
+    for micro_idx in range(cams_per_gpu):
         torch.cuda.nvtx.range_push(f"micro_batch_idx: {micro_idx}")
-        camera = batched_cameras[micro_idx]
+        camera = my_cameras[micro_idx]
+        this_filter = filters[micro_idx]
+        n_vis = this_filter.shape[0]
 
-        local_idx = local_visible_per_cam[micro_idx]
-        n_local_vis = local_idx.shape[0]
-
-        if micro_idx == 0:
-            _mem(f"cam0_start: n_local={n_local_vis}")
-
-        # Skip cameras with no visible local Gaussians
-        if n_local_vis == 0:
-            with torch.cuda.stream(comm_stream):
-                clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
-                microbatch_idx += 1
+        if n_vis == 0:
             torch.cuda.nvtx.range_pop()
             continue
 
         # ---------------------------------------------------------------
-        # 4.1: Fetch local SH from CPU → GPU (CLM streaming)
+        # 4.1: Fetch visible SH from CPU → GPU (CLM streaming)
         # ---------------------------------------------------------------
         with torch.cuda.stream(comm_stream), torch.no_grad():
-            local_shs = torch.empty(n_local_vis, 48, device="cuda")
+            local_shs = torch.empty(n_vis, 48, device="cuda")
             send_shs2gpu_stream(
                 local_shs,
                 gaussians._parameters,
-                local_idx,
+                this_filter,
                 grid_size,
                 block_size,
             )
@@ -633,16 +242,14 @@ def multi_gpu_clm_train_one_batch(
             cpu2gpu_event.record(comm_stream)
 
         # ---------------------------------------------------------------
-        # 4.2: Assemble local features for rendering
+        # 4.2: Assemble filtered features for rendering
         # ---------------------------------------------------------------
         cpu2gpu_event.wait(default_stream)
-        if micro_idx == 0:
-            _mem("cam0_after_sh_fetch")
 
-        filtered_xyz = gaussians._xyz.detach()[local_idx].requires_grad_(True)
-        _filtered_opacity = gaussians._opacity.detach()[local_idx].requires_grad_(True)
-        _filtered_scaling = gaussians._scaling.detach()[local_idx].requires_grad_(True)
-        _filtered_rotation = gaussians._rotation.detach()[local_idx].requires_grad_(True)
+        filtered_xyz = gaussians._xyz.detach()[this_filter].requires_grad_(True)
+        _filtered_opacity = gaussians._opacity.detach()[this_filter].requires_grad_(True)
+        _filtered_scaling = gaussians._scaling.detach()[this_filter].requires_grad_(True)
+        _filtered_rotation = gaussians._rotation.detach()[this_filter].requires_grad_(True)
 
         filtered_opacity_gpu = gaussians.opacity_activation(_filtered_opacity)
         filtered_scaling_gpu = gaussians.scaling_activation(_filtered_scaling)
@@ -651,9 +258,6 @@ def multi_gpu_clm_train_one_batch(
         # ---------------------------------------------------------------
         # 4.3: Forward pass
         # ---------------------------------------------------------------
-        if micro_idx == 0:
-            _mem(f"cam0_before_render: n_total={n_local_vis}")
-
         torch.cuda.nvtx.range_push("forward_pass")
 
         (
@@ -683,7 +287,7 @@ def multi_gpu_clm_train_one_batch(
         loss.backward()
 
         # Manual SH backward (CLM-style inplace)
-        shs_grad = torch.zeros(n_local_vis, 48, device="cuda")
+        shs_grad = torch.zeros(n_vis, 48, device="cuda")
         v_dirs = spherical_harmonics_bwd_inplace(
             degrees_to_use=gaussians.active_sh_degree,
             dirs=dirs,
@@ -701,137 +305,157 @@ def multi_gpu_clm_train_one_batch(
             if filtered_xyz.grad is not None:
                 gaussians._xyz.grad.scatter_add_(
                     dim=0, src=filtered_xyz.grad,
-                    index=local_idx.reshape(-1, 1).expand(-1, 3),
+                    index=this_filter.reshape(-1, 1).expand(-1, 3),
                 )
             if _filtered_opacity.grad is not None:
                 gaussians._opacity.grad.scatter_add_(
                     dim=0, src=_filtered_opacity.grad,
-                    index=local_idx.reshape(-1, 1),
+                    index=this_filter.reshape(-1, 1),
                 )
             if _filtered_scaling.grad is not None:
                 gaussians._scaling.grad.scatter_add_(
                     dim=0, src=_filtered_scaling.grad,
-                    index=local_idx.reshape(-1, 1).expand(-1, 3),
+                    index=this_filter.reshape(-1, 1).expand(-1, 3),
                 )
             if _filtered_rotation.grad is not None:
                 gaussians._rotation.grad.scatter_add_(
                     dim=0, src=_filtered_rotation.grad,
-                    index=local_idx.reshape(-1, 1).expand(-1, 4),
+                    index=this_filter.reshape(-1, 1).expand(-1, 4),
                 )
 
         # ---------------------------------------------------------------
-        # 4.6: Offload local SH gradients to CPU (CLM streaming)
+        # 4.6: Offload SH gradients to CPU buffer (accumulate)
         # ---------------------------------------------------------------
         gpu2cpu_event = torch.cuda.Event()
         gpu2cpu_event.record(default_stream)
 
         with torch.cuda.stream(comm_stream), torch.no_grad():
             gpu2cpu_event.wait(comm_stream)
-
             send_shs2cpu_grad_buffer_stream(
                 shs_grad,
-                parameters_grad_buffer[:N_local, :],
-                local_idx,
+                parameters_grad_buffer[:N, :],
+                this_filter,
                 True,  # accumulate
                 grid_size,
                 block_size,
             )
 
-            # Signal CPU Adam thread
-            clm_kernels.set_signal(signal_tensor_pinned, microbatch_idx, 1)
-            microbatch_idx += 1
-
         # ---------------------------------------------------------------
-        # 4.7: Cleanup and bookkeeping
+        # 4.7: Densification stats + cleanup
         # ---------------------------------------------------------------
-        del rendered_image, batched_colors_detached, dirs, v_dirs
-        del filtered_xyz, filtered_opacity_gpu, filtered_scaling_gpu, filtered_rotation_gpu
-        del _filtered_opacity, _filtered_scaling, _filtered_rotation
-
-        losses.append(loss.detach())
-        del loss
-
-        # Update densification statistics
         update_densification_stats_offload_accum_grads(
             scene,
             gaussians,
             int(utils.get_img_height()),
             int(utils.get_img_width()),
-            local_idx,
+            this_filter,
             batched_means2D.grad.squeeze(0),
             batched_radiis.squeeze(0),
         )
 
+        losses.append(loss.detach())
+
+        del rendered_image, batched_colors_detached, dirs, v_dirs, shs_grad
+        del filtered_xyz, filtered_opacity_gpu, filtered_scaling_gpu, filtered_rotation_gpu
+        del _filtered_opacity, _filtered_scaling, _filtered_rotation
+        del loss
         batched_means2D.grad = None
-        del batched_means2D, batched_radiis
+        del batched_means2D, batched_radiis, local_shs
 
         torch.cuda.nvtx.range_pop()
 
     # ==================================================================
-    # STAGE 5: Optimizer step + cleanup
+    # STAGE 5: Synchronize and AllReduce gradients
     # ==================================================================
+    # Wait for all SH grad offloads to complete
+    torch.cuda.current_stream().wait_stream(comm_stream)
+    torch.cuda.synchronize()
 
-    # 5.1: GPU Adam step for spatial params
+    # 5.1: AllReduce spatial gradients on GPU
+    if world_size > 1:
+        dist.all_reduce(gaussians._xyz.grad)
+        dist.all_reduce(gaussians._opacity.grad)
+        dist.all_reduce(gaussians._scaling.grad)
+        dist.all_reduce(gaussians._rotation.grad)
+
+    # Scale spatial grads by 1/bsz
     for param in gaussians.all_parameters()[:4]:
         if param.grad is not None:
             param.grad /= bsz
 
+    # 5.2: AllReduce SH gradients (CPU → GPU → AllReduce → GPU → CPU)
+    if world_size > 1:
+        sh_grad_staging = parameters_grad_buffer[:N].cuda()
+        dist.all_reduce(sh_grad_staging)
+        parameters_grad_buffer[:N].copy_(sh_grad_staging.cpu())
+        del sh_grad_staging
+        torch.cuda.empty_cache()
+
+    # 5.3: AllReduce densification stats so all ranks make identical decisions
+    if world_size > 1:
+        dist.all_reduce(gaussians.xyz_gradient_accum)
+        dist.all_reduce(gaussians.denom)
+        # max_radii2D needs element-wise max
+        dist.all_reduce(gaussians.max_radii2D, op=dist.ReduceOp.MAX)
+
+    # ==================================================================
+    # STAGE 6: Optimizer step
+    # ==================================================================
+
+    # 6.1: GPU Adam for spatial params
     if not args.stop_update_param:
         if args.sparse_adam:
-            # Build visibility mask: union of all locally-visible Gaussians
-            visibility_mask = torch.zeros(N_local, device="cuda")
-            for filt in local_filters:
+            # Build global visibility mask (union across all GPUs)
+            visibility_mask = torch.zeros(N, device="cuda", dtype=torch.bool)
+            for filt in filters:
                 if filt.shape[0] > 0:
-                    visibility_mask[filt] = 1.0
-            gaussians.optimizer.gpu_adam.step(visibility=visibility_mask)
+                    visibility_mask[filt] = True
+            if world_size > 1:
+                vis_int = visibility_mask.int()
+                dist.all_reduce(vis_int)
+                visibility_mask = vis_int > 0
+            gaussians.optimizer.gpu_adam.step(visibility=visibility_mask.float())
         else:
             gaussians.optimizer.gpu_adam.step()
     gaussians.optimizer.gpu_adam.zero_grad(set_to_none=True)
 
-    # 5.2: Wait for CPU Adam to finish
-    cpuadam_worker.join()
+    # 6.2: CPU Adam for SH
+    # Compute union of visible indices for sparse step
+    visible_set = torch.zeros(N, dtype=torch.bool, device="cuda")
+    for filt in filters:
+        if filt.shape[0] > 0:
+            visible_set[filt] = True
+    if world_size > 1:
+        vis_int = visible_set.int()
+        dist.all_reduce(vis_int)
+        visible_set = vis_int > 0
+    visible_indices = torch.nonzero(visible_set).flatten().to(torch.int32).cpu()
 
-    utils.memory_report("after cpuadam_worker joined (multi_gpu_clm)")
+    if not args.stop_update_param and visible_indices.shape[0] > 0:
+        gaussians._parameters.grad = parameters_grad_buffer[:N]
+        gaussians.optimizer.cpu_adam.sparse_adam_inc_step()
+        gaussians.optimizer.cpu_adam.sparse_step(
+            sparse_indices=visible_indices,
+            version=3,  # inplace_zero_grad
+            scale=1.0 / bsz,
+        )
 
-    # 5.3: Synchronize
+    utils.memory_report("after optimizer step (multi_gpu_clm M1)")
     torch.cuda.synchronize()
 
+    # ==================================================================
+    # STAGE 7: Gather losses across ranks for logging
+    # ==================================================================
+    if world_size > 1 and len(losses) > 0:
+        local_losses = torch.stack(losses)
+        all_loss_list = [
+            torch.zeros_like(local_losses) for _ in range(world_size)
+        ]
+        dist.all_gather(all_loss_list, local_losses)
+        all_losses = torch.cat(all_loss_list)
+        losses = list(all_losses.unbind())
+
     return losses, list(range(bsz)), [1.0] * bsz
-
-
-# =========================================================================
-# Helper: build finish_indices_filters for CPU Adam
-# =========================================================================
-
-def _build_finish_indices(local_filters, N_local, bsz):
-    """
-    Build finish_indices_filters for CPU Adam batched_sparse_step.
-    Groups local Gaussians by when they're last visible across micro-batches.
-
-    Returns list of (bsz+1) index tensors:
-      [0]: Gaussians never visible in this batch
-      [1..bsz]: Gaussians whose last visibility is in micro-batch i
-    """
-    # Track last micro-batch each Gaussian was visible
-    last_visible = torch.full((N_local,), -1, dtype=torch.long, device="cpu")
-
-    for i, filt in enumerate(local_filters):
-        if filt.shape[0] > 0:
-            filt_cpu = filt.cpu()
-            last_visible[filt_cpu] = i
-
-    result = []
-    # Group 0: never visible
-    never_mask = last_visible == -1
-    result.append(torch.nonzero(never_mask).flatten().to(torch.int32))
-
-    # Groups 1..bsz: last visible in micro-batch (bsz-1-i) -> group i
-    for i in range(bsz):
-        target_mb = bsz - 1 - i
-        mask = last_visible == target_mb
-        result.append(torch.nonzero(mask).flatten().to(torch.int32))
-
-    return result
 
 
 # =========================================================================
@@ -841,39 +465,15 @@ def _build_finish_indices(local_filters, N_local, bsz):
 def multi_gpu_clm_eval_one_cam(camera, gaussians, background, scene):
     """
     Render one camera for evaluation.
-    AllGathers full scene (spatial from GPU, SH from CPU→GPU staging).
+    Since all Gaussians are replicated, just render directly.
     """
     with torch.no_grad():
-        if dist.is_initialized() and gaussians.world_size > 1:
-            # Gather spatial from GPU
-            all_xyz = [torch.zeros(s, 3, device="cuda") for s in gaussians.partition_sizes]
-            all_opacity = [torch.zeros(s, 1, device="cuda") for s in gaussians.partition_sizes]
-            all_scaling = [torch.zeros(s, 3, device="cuda") for s in gaussians.partition_sizes]
-            all_rotation = [torch.zeros(s, 4, device="cuda") for s in gaussians.partition_sizes]
+        full_xyz = gaussians._xyz.detach()
+        full_opacity = gaussians.opacity_activation(gaussians._opacity.detach())
+        full_scaling = gaussians.scaling_activation(gaussians._scaling.detach())
+        full_rotation = gaussians.rotation_activation(gaussians._rotation.detach())
+        full_shs = gaussians._parameters.detach().cuda()
 
-            dist.all_gather(all_xyz, gaussians._xyz.detach().contiguous())
-            dist.all_gather(all_opacity, gaussians._opacity.detach().contiguous())
-            dist.all_gather(all_scaling, gaussians._scaling.detach().contiguous())
-            dist.all_gather(all_rotation, gaussians._rotation.detach().contiguous())
-
-            # Gather SH: CPU→GPU staging, then AllGather
-            local_sh = gaussians._parameters.detach().clone().cuda()
-            all_sh = [torch.zeros(s, 48, device="cuda") for s in gaussians.partition_sizes]
-            dist.all_gather(all_sh, local_sh.contiguous())
-
-            full_xyz = torch.cat(all_xyz)
-            full_opacity = gaussians.opacity_activation(torch.cat(all_opacity))
-            full_scaling = gaussians.scaling_activation(torch.cat(all_scaling))
-            full_rotation = gaussians.rotation_activation(torch.cat(all_rotation))
-            full_shs = torch.cat(all_sh)
-        else:
-            full_xyz = gaussians._xyz.detach()
-            full_opacity = gaussians.opacity_activation(gaussians._opacity.detach())
-            full_scaling = gaussians.scaling_activation(gaussians._scaling.detach())
-            full_rotation = gaussians.rotation_activation(gaussians._rotation.detach())
-            full_shs = gaussians._parameters.detach().cuda()
-
-        # Use base_engine's render helper
         from strategies.base_engine import pipeline_forward_one_step
 
         rendered_image, _, _ = pipeline_forward_one_step(

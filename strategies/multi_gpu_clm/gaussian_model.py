@@ -1,31 +1,26 @@
 """
-GaussianModelMultiGPUCLM
-========================
+GaussianModelMultiGPUCLM — Camera-Parallel Replicated Model
+============================================================
 
-Hybrid Gaussian model that combines:
-  - Multi-GPU spatial partitioning (from multi_gpu): xyz, opacity, scaling,
-    rotation partitioned across GPUs with a replicated lightweight proxy
-  - CLM CPU offload (from clm_offload): SH features stored in CPU pinned
-    memory, with CPU Adam optimizer
+Camera parallelism design: every GPU holds ALL Gaussians (replicated).
+Each GPU renders a subset of cameras per batch, then AllReduces gradients.
 
 Memory layout:
-  CPU (pinned):
-    parameters_buffer     — ALL N Gaussians' SH features (N × 48 float32)
-    parameters_grad_buffer — SH gradient accumulator (N × 48 float32)
-    CPU Adam states for SH (~2× SH size)
+  CPU (pinned, per-process):
+    parameters_buffer       — ALL N Gaussians' SH features (N × 48 float32)
+    parameters_grad_buffer  — SH gradient accumulator (N × 48 float32)
+    CPU Adam states for SH
 
-  GPU k (of K total):
-    _xyz       — local partition (N/K × 3)
-    _opacity   — local partition (N/K × 1)
-    _scaling   — local partition (N/K × 3)
-    _rotation  — local partition (N/K × 4)
+  GPU (replicated on every rank):
+    _xyz       — ALL N × 3
+    _opacity   — ALL N × 1
+    _scaling   — ALL N × 3
+    _rotation  — ALL N × 4
     GPU Adam states for spatial params
-    global_xyz, global_opacity — replicated proxy (N × 3, N × 1)
-    Transient SH cache (fetched per camera, ~visible_count × 48)
 
-Key insight: the CPU holds ALL N Gaussians' SH features as a single
-contiguous pinned buffer.  Any GPU can fetch any Gaussian's SH.  The
-"ownership" partitioning is only for spatial metadata and optimizer state.
+Because all GPUs have identical parameters and receive AllReduced gradients,
+optimizer states stay in sync and densification decisions are deterministic
+across ranks.
 """
 
 import torch
@@ -50,8 +45,9 @@ from strategies.base_gaussian_model import BaseGaussianModel
 
 class GaussianModelMultiGPUCLM(BaseGaussianModel):
     """
-    Multi-GPU CLM: spatial metadata partitioned across GPUs,
+    Camera-parallel CLM: ALL Gaussians replicated on every GPU,
     SH features on CPU pinned memory with CLM streaming.
+    Gradients AllReduced across ranks for correctness.
     """
 
     def _get_device(self):
@@ -95,14 +91,14 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
             assert self.parameters_grad_buffer.is_pinned()
 
         # ==============================================================
-        # 2. Prepare full point cloud on GPU (temporarily)
+        # 2. Prepare full point cloud on GPU
         # ==============================================================
         all_points = torch.tensor(np.asarray(pcd.points)).float().cuda()
         all_points = all_points.contiguous()
         all_colors = RGB2SH(torch.tensor(np.asarray(pcd.colors)).float().cuda())
 
-        N_total = all_points.shape[0]
-        print(f"[Rank {self.rank}] Total points before partitioning: {N_total}")
+        N = all_points.shape[0]
+        print(f"[Rank {self.rank}] Total points: {N}")
 
         # ==============================================================
         # 3. Compute nearest-neighbor distances (needed for initial scales)
@@ -115,7 +111,7 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         # 4. Build SH features on GPU (temporary)
         # ==============================================================
         all_features = torch.zeros(
-            (N_total, 3, (self.max_sh_degree + 1) ** 2),
+            (N, 3, (self.max_sh_degree + 1) ** 2),
             dtype=torch.float32,
             device="cuda",
         )
@@ -127,73 +123,48 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         # ==============================================================
         if subsample_ratio != 1.0:
             assert 0 < subsample_ratio < 1
-            sub_N = int(N_total * subsample_ratio)
+            sub_N = int(N * subsample_ratio)
             print(f"[Rank {self.rank}] Subsampling to {sub_N} points")
-            perm = torch.randperm(N_total, device="cuda")[:sub_N].sort()[0]
+            perm = torch.randperm(N, device="cuda")[:sub_N].sort()[0]
             all_points = all_points[perm]
             all_scales = all_scales[perm]
             all_features = all_features[perm]
-            N_total = sub_N
+            N = sub_N
 
         # ==============================================================
-        # 6. Spatial partitioning: sort by longest axis, split evenly
+        # 6. Spatial params: ALL N Gaussians on GPU (replicated)
         # ==============================================================
-        longest_axis = (
-            (all_points.max(0)[0] - all_points.min(0)[0]).argmax().item()
-        )
-        sorted_indices = torch.argsort(all_points[:, longest_axis])
+        rots = torch.zeros((N, 4), device="cuda")
+        rots[:, 0] = 1.0
 
-        chunk_size = N_total // self.world_size
-        start = self.rank * chunk_size
-        end = start + chunk_size if self.rank < self.world_size - 1 else N_total
-
-        local_indices = sorted_indices[start:end]
-        N_local = local_indices.shape[0]
-
-        print(
-            f"[Rank {self.rank}] Owns Gaussians [{start}, {end}) = {N_local} points "
-            f"(split along axis {longest_axis})"
+        opacities = inverse_sigmoid(
+            0.1 * torch.ones((N, 1), dtype=torch.float32, device="cuda")
         )
 
-        # ==============================================================
-        # 7. Extract local spatial partition → GPU
-        # ==============================================================
-        local_xyz = all_points[local_indices].contiguous()
-        local_scales = all_scales[local_indices].contiguous()
-
-        local_rots = torch.zeros((N_local, 4), device="cuda")
-        local_rots[:, 0] = 1.0
-
-        local_opacities = inverse_sigmoid(
-            0.1 * torch.ones((N_local, 1), dtype=torch.float32, device="cuda")
-        )
-
-        # Spatial params as nn.Parameters on GPU
-        self._xyz = nn.Parameter(local_xyz.requires_grad_(True))
-        self._scaling = nn.Parameter(local_scales.requires_grad_(True))
-        self._rotation = nn.Parameter(local_rots.requires_grad_(True))
-        self._opacity = nn.Parameter(local_opacities.requires_grad_(True))
+        self._xyz = nn.Parameter(all_points.requires_grad_(True))
+        self._scaling = nn.Parameter(all_scales.requires_grad_(True))
+        self._rotation = nn.Parameter(rots.requires_grad_(True))
+        self._opacity = nn.Parameter(opacities.requires_grad_(True))
 
         # ==============================================================
-        # 8. Store ALL SH features in CPU pinned memory
+        # 7. Store ALL SH features in CPU pinned memory
         # ==============================================================
-        # Flatten features: (N, 3, 16) → dc (N, 3) + rest (N, 45) → concat (N, 48)
-        # We store ALL N_total features, not just local partition
-        local_features = all_features[local_indices].contiguous()
         features_dc = (
-            local_features[:, :, 0:1].transpose(1, 2).contiguous().view(N_local, -1)
-        )  # (N_local, 3)
+            all_features[:, :, 0:1].transpose(1, 2).contiguous().view(N, -1)
+        )  # (N, 3)
         features_rest = (
-            local_features[:, :, 1:].transpose(1, 2).contiguous().view(N_local, -1)
-        )  # (N_local, 45)
+            all_features[:, :, 1:].transpose(1, 2).contiguous().view(N, -1)
+        )  # (N, 45)
 
-        # Store in CPU pinned buffer (like CLM)
-        # Move GPU tensors to CPU before writing to pinned buffer
         dims = [features_dc.shape[1], features_rest.shape[1]]
-        torch.cat((features_dc.cpu(), features_rest.cpu()), dim=1, out=self.parameters_buffer[:N_local])
+        torch.cat(
+            (features_dc.cpu(), features_rest.cpu()),
+            dim=1,
+            out=self.parameters_buffer[:N],
+        )
 
         self._parameters = nn.Parameter(
-            self.parameters_buffer[:N_local].requires_grad_(True)
+            self.parameters_buffer[:N].requires_grad_(True)
         )
         self._features_dc, self._features_rest = torch.split(
             self._parameters, dims, dim=1
@@ -201,112 +172,17 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         self.param_dims = torch.tensor(dims, dtype=torch.int, device="cuda")
 
         # Tracking buffers on GPU
-        self.max_radii2D = torch.zeros((N_local,), device="cuda")
-        self.sum_visible_count_in_one_batch = torch.zeros((N_local,), device="cuda")
+        self.max_radii2D = torch.zeros((N,), device="cuda")
+        self.sum_visible_count_in_one_batch = torch.zeros((N,), device="cuda")
 
-        # ==============================================================
-        # 9. Build global proxy for cross-GPU visibility
-        # ==============================================================
-        self._build_global_proxy()
-
-        # Free temporary full arrays
+        # Free temporary arrays
         del all_points, all_scales, all_features, all_colors, dist2
-        del local_features, features_dc, features_rest
+        del features_dc, features_rest
         torch.cuda.empty_cache()
 
         print(
-            f"[Rank {self.rank}] Init complete. Local spatial: {N_local} on GPU, "
-            f"SH features: {N_local} on CPU pinned, "
-            f"Global proxy: {self.global_N}"
-        )
-
-    # ------------------------------------------------------------------
-    # Global proxy: lightweight replicated xyz + opacity for visibility
-    # ------------------------------------------------------------------
-
-    def _build_global_proxy(self):
-        """
-        AllGather xyz and opacity → replicated lightweight proxy for visibility.
-        ~16 bytes per Gaussian — trivially fits for millions.
-        """
-        if not dist.is_initialized() or self.world_size == 1:
-            self.global_xyz = self._xyz.detach()
-            self.global_opacity = self._opacity.detach()
-            self.global_N = self._xyz.shape[0]
-            self.partition_sizes = [self._xyz.shape[0]]
-            self.partition_offsets = [0]
-            return
-
-        # Gather local sizes (may differ across ranks)
-        local_n = torch.tensor([self._xyz.shape[0]], device="cuda")
-        all_sizes = [
-            torch.zeros(1, device="cuda", dtype=torch.long)
-            for _ in range(self.world_size)
-        ]
-        dist.all_gather(all_sizes, local_n)
-        self.partition_sizes = [int(s.item()) for s in all_sizes]
-        self.global_N = sum(self.partition_sizes)
-        self.partition_offsets = [0]
-        for s in self.partition_sizes[:-1]:
-            self.partition_offsets.append(self.partition_offsets[-1] + s)
-
-        # AllGather xyz
-        local_xyz = self._xyz.detach().contiguous()
-        gathered_xyz = [
-            torch.zeros(s, 3, device="cuda") for s in self.partition_sizes
-        ]
-        dist.all_gather(gathered_xyz, local_xyz)
-        self.global_xyz = torch.cat(gathered_xyz, dim=0)
-
-        # AllGather opacity
-        local_opacity = self._opacity.detach().contiguous()
-        gathered_opacity = [
-            torch.zeros(s, 1, device="cuda") for s in self.partition_sizes
-        ]
-        dist.all_gather(gathered_opacity, local_opacity)
-        self.global_opacity = torch.cat(gathered_opacity, dim=0)
-
-    def sync_global_proxy(self):
-        """Keep the replicated proxy up-to-date after optimizer step."""
-        self._build_global_proxy()
-
-    def get_local_and_remote_indices(self, visible_global_indices):
-        """
-        Given global indices visible for a camera, split into:
-          - local (owned by this rank): for spatial params from VRAM, SH from CPU
-          - remote (owned by peers): spatial from global proxy, SH from CPU or P2P
-        """
-        my_start = self.partition_offsets[self.rank]
-        my_end = my_start + self.partition_sizes[self.rank]
-
-        local_mask = (visible_global_indices >= my_start) & (
-            visible_global_indices < my_end
-        )
-        remote_mask = ~local_mask
-
-        local_global_idx = visible_global_indices[local_mask]
-        local_idx = local_global_idx - my_start
-
-        remote_global_idx = visible_global_indices[remote_mask]
-
-        # Determine owner rank and local index for each remote Gaussian
-        remote_rank = torch.zeros_like(remote_global_idx)
-        remote_local_idx = torch.zeros_like(remote_global_idx)
-        for r in range(self.world_size):
-            if r == self.rank:
-                continue
-            r_start = self.partition_offsets[r]
-            r_end = r_start + self.partition_sizes[r]
-            mask_r = (remote_global_idx >= r_start) & (remote_global_idx < r_end)
-            remote_rank[mask_r] = r
-            remote_local_idx[mask_r] = remote_global_idx[mask_r] - r_start
-
-        return (
-            local_global_idx,
-            local_idx,
-            remote_global_idx,
-            remote_rank,
-            remote_local_idx,
+            f"[Rank {self.rank}] Init complete. Spatial: {N} on GPU (replicated), "
+            f"SH features: {N} on CPU pinned"
         )
 
     # ------------------------------------------------------------------
@@ -336,7 +212,6 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         args = utils.get_args()
         log_file = utils.get_log_file()
 
-        # Use UnifiedAdam (like CLM): GPU Adam for spatial, CPU Adam for SH
         l = [
             {
                 "params": [self._xyz],
@@ -445,65 +320,49 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
     # ------------------------------------------------------------------
 
     def save_ply(self, path):
-        """Save the full global model. Rank 0 gathers all partitions."""
+        """Save model. Only rank 0 writes the file."""
         mkdir_p(os.path.dirname(path))
 
-        if dist.is_initialized() and self.world_size > 1:
-            # AllGather spatial from GPU
-            all_xyz = [torch.zeros(s, 3, device="cuda") for s in self.partition_sizes]
-            all_opacity = [torch.zeros(s, 1, device="cuda") for s in self.partition_sizes]
-            all_scaling = [torch.zeros(s, 3, device="cuda") for s in self.partition_sizes]
-            all_rotation = [torch.zeros(s, 4, device="cuda") for s in self.partition_sizes]
+        if self.rank != 0:
+            if dist.is_initialized():
+                dist.barrier()
+            return
 
-            dist.all_gather(all_xyz, self._xyz.detach().contiguous())
-            dist.all_gather(all_opacity, self._opacity.detach().contiguous())
-            dist.all_gather(all_scaling, self._scaling.detach().contiguous())
-            dist.all_gather(all_rotation, self._rotation.detach().contiguous())
+        xyz = self._xyz.detach().cpu().numpy()
+        opacity = self._opacity.detach().cpu().numpy()
+        scaling = self._scaling.detach().cpu().numpy()
+        rotation = self._rotation.detach().cpu().numpy()
+        params = self._parameters.detach()
 
-            xyz = torch.cat(all_xyz).cpu().numpy()
-            opacity = torch.cat(all_opacity).cpu().numpy()
-            scaling = torch.cat(all_scaling).cpu().numpy()
-            rotation = torch.cat(all_rotation).cpu().numpy()
+        features_dc = params[:, :3].cpu().numpy()
+        features_rest = params[:, 3:].cpu().numpy()
+        normals = np.zeros_like(xyz)
 
-            # AllGather SH from CPU via GPU staging
-            local_sh = self._parameters.detach().clone().cuda()  # CPU→GPU
-            all_sh = [torch.zeros(s, 48, device="cuda") for s in self.partition_sizes]
-            dist.all_gather(all_sh, local_sh.contiguous())
-            params = torch.cat(all_sh)
-        else:
-            xyz = self._xyz.detach().cpu().numpy()
-            opacity = self._opacity.detach().cpu().numpy()
-            scaling = self._scaling.detach().cpu().numpy()
-            rotation = self._rotation.detach().cpu().numpy()
-            params = self._parameters.detach()
+        features_dc = (
+            features_dc.reshape(-1, 1, 3).transpose(0, 2, 1).reshape(-1, 3)
+        )
+        features_rest = (
+            features_rest.reshape(-1, 15, 3).transpose(0, 2, 1).reshape(-1, 45)
+        )
 
-        if self.rank == 0:
-            features_dc = params[:, :3].cpu().numpy()
-            features_rest = params[:, 3:].cpu().numpy()
-            normals = np.zeros_like(xyz)
+        dtype_full = [
+            (attribute, "f4")
+            for attribute in self.construct_list_of_attributes()
+        ]
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate(
+            (xyz, normals, features_dc, features_rest, opacity, scaling, rotation),
+            axis=1,
+        )
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, "vertex")
+        PlyData([el]).write(path)
 
-            features_dc = (
-                features_dc.reshape(-1, 1, 3).transpose(0, 2, 1).reshape(-1, 3)
-            )
-            features_rest = (
-                features_rest.reshape(-1, 15, 3).transpose(0, 2, 1).reshape(-1, 45)
-            )
-
-            dtype_full = [
-                (attribute, "f4")
-                for attribute in self.construct_list_of_attributes()
-            ]
-            elements = np.empty(xyz.shape[0], dtype=dtype_full)
-            attributes = np.concatenate(
-                (xyz, normals, features_dc, features_rest, opacity, scaling, rotation),
-                axis=1,
-            )
-            elements[:] = list(map(tuple, attributes))
-            el = PlyElement.describe(elements, "vertex")
-            PlyData([el]).write(path)
+        if dist.is_initialized():
+            dist.barrier()
 
     def load_ply(self, path):
-        """Load and repartition a saved PLY file."""
+        """Load a saved PLY file."""
         plydata = PlyData.read(path)
         xyz = np.stack(
             (
@@ -546,7 +405,7 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         self._opacity = self.optimizer.param_groups[1]["params"][0]
 
     def prune_points(self, mask):
-        """Prune Gaussians locally. Each GPU prunes its own partition."""
+        """Prune Gaussians. Identical operation on every GPU (deterministic)."""
         valid_points_mask = ~mask
         N_new = valid_points_mask.sum().item()
 
@@ -610,8 +469,6 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
                 self.sum_visible_count_in_one_batch[valid_points_mask]
             )
 
-        self._build_global_proxy()
-
     def densification_postfix(
         self,
         new_xyz,
@@ -622,7 +479,7 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         new_rotation,
         new_parameters=None,
     ):
-        """Add new Gaussians to local partition. Spatial on GPU, SH on CPU pinned."""
+        """Add new Gaussians. Identical operation on every GPU."""
         if new_parameters is None:
             new_parameters = torch.cat((new_features_dc, new_features_rest), dim=1)
 
@@ -630,7 +487,6 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         N_new_pts = new_xyz.shape[0]
         N_total = N_old + N_new_pts
 
-        # For spatial params (GPU) and SH (CPU), handle separately
         d = {
             "xyz": new_xyz,
             "opacity": new_opacities,
@@ -647,7 +503,6 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
 
             if name == "parameters":
                 # SH: extend in CPU pinned buffer
-                old = group["params"][0]
                 self.parameters_buffer[N_old:N_total].copy_(
                     extension_tensor.cpu()
                     if extension_tensor.is_cuda
@@ -657,16 +512,22 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
                     stored_state["exp_avg"] = torch.cat(
                         (
                             stored_state["exp_avg"],
-                            torch.zeros_like(extension_tensor.cpu()
-                                if extension_tensor.is_cuda else extension_tensor),
+                            torch.zeros_like(
+                                extension_tensor.cpu()
+                                if extension_tensor.is_cuda
+                                else extension_tensor
+                            ),
                         ),
                         dim=0,
                     )
                     stored_state["exp_avg_sq"] = torch.cat(
                         (
                             stored_state["exp_avg_sq"],
-                            torch.zeros_like(extension_tensor.cpu()
-                                if extension_tensor.is_cuda else extension_tensor),
+                            torch.zeros_like(
+                                extension_tensor.cpu()
+                                if extension_tensor.is_cuda
+                                else extension_tensor
+                            ),
                         ),
                         dim=0,
                     )
@@ -698,12 +559,16 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
                     )
                     del self.optimizer.state[group["params"][0]]
                     group["params"][0] = nn.Parameter(
-                        torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True)
+                        torch.cat(
+                            (group["params"][0], extension_tensor), dim=0
+                        ).requires_grad_(True)
                     )
                     self.optimizer.state[group["params"][0]] = stored_state
                 else:
                     group["params"][0] = nn.Parameter(
-                        torch.cat((group["params"][0], extension_tensor), dim=0).requires_grad_(True)
+                        torch.cat(
+                            (group["params"][0], extension_tensor), dim=0
+                        ).requires_grad_(True)
                     )
 
         # Refresh references
@@ -743,8 +608,6 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
                 dim=0,
             )
 
-        self._build_global_proxy()
-
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         selected_pts_mask = torch.where(
             torch.norm(grads, dim=-1) >= grad_threshold, True, False
@@ -755,7 +618,6 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
             <= self.percent_dense * scene_extent,
         )
 
-        # SH features are on CPU — use CPU mask for CPU tensors
         selected_pts_mask_cpu = selected_pts_mask.cpu()
 
         new_xyz = self._xyz[selected_pts_mask]
@@ -786,7 +648,6 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
             > self.percent_dense * scene_extent,
         )
 
-        # SH features are on CPU — use CPU mask for CPU tensors
         selected_pts_mask_cpu = selected_pts_mask.cpu()
 
         stds = self.get_scaling[selected_pts_mask].repeat(N, 1)
@@ -833,8 +694,17 @@ class GaussianModelMultiGPUCLM(BaseGaussianModel):
         width,
         height,
     ):
-        """Accumulate densification statistics for locally-owned visible Gaussians."""
-        self.max_radii2D = torch.zeros((self._xyz.shape[0],), device="cuda")
+        """Accumulate densification statistics for visible Gaussians."""
+        self.max_radii2D[send2gpu_final_filter_indices] = torch.max(
+            self.max_radii2D[send2gpu_final_filter_indices], radii
+        )
+        grad = viewspace_point_tensor_grad  # (N, 2)
+        grad[:, 0] *= width * 0.5
+        grad[:, 1] *= height * 0.5
+        self.xyz_gradient_accum[send2gpu_final_filter_indices] += torch.norm(
+            grad, dim=-1, keepdim=True
+        )
+        self.denom[send2gpu_final_filter_indices] += 1
 
     def save_tensors(self, parent_path):
         mkdir_p(parent_path)
