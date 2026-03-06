@@ -27,3 +27,4 @@ slurm/
 srun/
 core.*
 old/*.bak
+**/*.bak
