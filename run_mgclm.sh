@@ -1,8 +1,10 @@
 #!/bin/bash
-# Multi-GPU CLM: auto-detects allocated GPUs.
+# Multi-GPU CLM training on 2 GPUs.
 # Usage:
-#   sbatch --gres=gpu:a40:2 run_mgclm.sh           # M1 only
-#   sbatch --gres=gpu:a40:2 run_mgclm.sh --p2p      # M1+M3 (collaborative SH fetch)
+#   sbatch run_mgclm.sh a40             # M1 on 2x A40
+#   sbatch run_mgclm.sh a100            # M1 on 2x A100
+#   sbatch run_mgclm.sh a40  --p2p      # M1+M3 on 2x A40
+#   sbatch run_mgclm.sh a100 --p2p      # M1+M3 on 2x A100
 #
 #SBATCH --output=./slurm/slurm%j.out
 #SBATCH --error=./slurm/slurm%j.err
@@ -14,12 +16,26 @@
 
 set -e
 
-# Parse script arguments
+# ---- Parse arguments ----
+GPU_CHOICE="${1:-a40}"
+case "${GPU_CHOICE}" in
+    a40)  GRES="gpu:a40:2" ;;
+    a100) GRES="gpu:a100:2" ;;
+    *)    echo "Usage: sbatch run_mgclm.sh {a40|a100} [--p2p]"; exit 1 ;;
+esac
+
 P2P_FLAG=""
 MODE_TAG="m1"
-if [[ "$1" == "--p2p" ]]; then
+if [[ "$2" == "--p2p" ]]; then
     P2P_FLAG="--enable_p2p_caching"
     MODE_TAG="m1m3"
+fi
+
+# Re-submit with correct --gres if run directly
+if [[ -z "$SLURM_JOB_ID" ]]; then
+    echo "Submitting: sbatch --gres=${GRES} $0 $@"
+    sbatch --gres="${GRES}" "$0" "$@"
+    exit 0
 fi
 
 module purge
@@ -39,11 +55,8 @@ NUM_GPUS=$(nvidia-smi -L | wc -l)
 GPU_IDS=$(seq -s, 0 $((NUM_GPUS - 1)))
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 
-# Derive a tag from GPU name for output directory
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader | head -1 | tr ' ' '_' | tr '[:upper:]' '[:lower:]')
-
 echo "=== Multi-GPU CLM (${MODE_TAG}) ==="
-echo "GPUs detected: ${NUM_GPUS}"
+echo "GPU: ${GPU_CHOICE} x${NUM_GPUS}"
 echo "P2P caching: ${P2P_FLAG:-disabled}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo "=============================="
@@ -57,4 +70,4 @@ torchrun \
     --bsz 8 \
     --eval \
     ${P2P_FLAG} \
-    -m "output/rubble_${GPU_NAME}_x${NUM_GPUS}_${MODE_TAG}"
+    -m "output/rubble_${GPU_CHOICE}_x${NUM_GPUS}_${MODE_TAG}"

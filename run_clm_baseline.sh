@@ -1,8 +1,8 @@
 #!/bin/bash
 # CLM baseline: single-GPU CLM offload training.
-# Usage: sbatch run_clm_baseline.sh [GPU_TYPE]
-#   GPU_TYPE examples: a40, a100, nvidia_a100-pcie-40gb, quadro_rtx_6000
-#   Default: a40
+# Usage:
+#   sbatch run_clm_baseline.sh a40      # 1x A40
+#   sbatch run_clm_baseline.sh a100     # 1x A100
 #
 #SBATCH --output=./slurm/slurm%j.out
 #SBATCH --error=./slurm/slurm%j.err
@@ -14,15 +14,19 @@
 
 set -e
 
-# ---- GPU type from argument or default ----
-GPU_TYPE="${1:-a40}"
+# ---- Parse arguments ----
+GPU_CHOICE="${1:-a40}"
+case "${GPU_CHOICE}" in
+    a40)  GRES="gpu:a40:1" ;;
+    a100) GRES="gpu:a100:1" ;;
+    *)    echo "Usage: sbatch run_clm_baseline.sh {a40|a100}"; exit 1 ;;
+esac
 
-# Request 1 GPU of the specified type via srun override
-export SLURM_GRES="gpu:${GPU_TYPE}:1"
-# Re-submit with correct gres if not already set by SBATCH
+# Re-submit with correct --gres if run directly
 if [[ -z "$SLURM_JOB_ID" ]]; then
-    echo "Submit with: sbatch --gres=gpu:${GPU_TYPE}:1 $0 $@"
-    exit 1
+    echo "Submitting: sbatch --gres=${GRES} $0 $@"
+    sbatch --gres="${GRES}" "$0" "$@"
+    exit 0
 fi
 
 module purge
@@ -36,7 +40,7 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 
 echo "=== CLM Baseline ==="
-echo "GPU type: ${GPU_TYPE}"
+echo "GPU: ${GPU_CHOICE}"
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo "===================="
 
@@ -45,4 +49,4 @@ python train.py \
     --clm_offload \
     --bsz 8 \
     --eval \
-    -m "output/rubble_${GPU_TYPE}_clm"
+    -m "output/rubble_${GPU_CHOICE}_clm"
