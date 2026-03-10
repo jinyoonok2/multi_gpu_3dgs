@@ -162,25 +162,27 @@ class Scene:
 
         self.decode_dataset_path = os.path.join(args.decode_dataset_path, "dataset_raw")
 
-        if not os.path.isdir(self.decode_dataset_path):
-            os.makedirs(self.decode_dataset_path)
-            statvfs = os.statvfs(args.decode_dataset_path)
-            available_space_in_GB = 1.0 * statvfs.f_frsize * statvfs.f_bavail / 1e9
-            assert (
-                available_space_in_GB >= dataset_size_in_GB
-            ), f"Not enough space in disk for decompressed dataset. avail: {available_space_in_GB}. need: {dataset_size_in_GB}"
-            log_file.write(
-                f"[NOTE]: Pre-decoding dataset({dataset_size_in_GB}GB) to disk dir: {self.decode_dataset_path}\n"
-            )
-            do_decode = True
-        else:
-            log_file.write(
-                f"[NOTE]: Reusing decoded dataset({dataset_size_in_GB}GB) in disk dir: {self.decode_dataset_path}\n"
-            )
-            utils.print_rank_0(
-                f"Reusing decoded dataset on disk: {self.decode_dataset_path}"
-            )
-            do_decode = False
+        is_rank_0 = getattr(args, 'rank', 0) == 0
+        do_decode = False
+        if is_rank_0:
+            if not os.path.isdir(self.decode_dataset_path):
+                os.makedirs(self.decode_dataset_path, exist_ok=True)
+                statvfs = os.statvfs(args.decode_dataset_path)
+                available_space_in_GB = 1.0 * statvfs.f_frsize * statvfs.f_bavail / 1e9
+                assert (
+                    available_space_in_GB >= dataset_size_in_GB
+                ), f"Not enough space in disk for decompressed dataset. avail: {available_space_in_GB}. need: {dataset_size_in_GB}"
+                log_file.write(
+                    f"[NOTE]: Pre-decoding dataset({dataset_size_in_GB}GB) to disk dir: {self.decode_dataset_path}\n"
+                )
+                do_decode = True
+            else:
+                log_file.write(
+                    f"[NOTE]: Reusing decoded dataset({dataset_size_in_GB}GB) in disk dir: {self.decode_dataset_path}\n"
+                )
+                utils.print_rank_0(
+                    f"Reusing decoded dataset on disk: {self.decode_dataset_path}"
+                )
 
         self.train_cameras = None
         self.test_cameras = None
@@ -205,6 +207,10 @@ class Scene:
                 utils.print_rank_0("Decoding Test Cameras To Disk")
                 predecode_dataset_to_disk(test_cameras, args)
             self.test_cameras_info = test_cameras
+
+        if getattr(args, 'enable_distributed', False):
+            import torch.distributed as dist
+            dist.barrier()  # All ranks wait for rank 0 to finish decoding
 
             if len(test_cameras) > 0:
                 log_file.write("Test Image size: {}x{}\n".format(orig_h, orig_w))

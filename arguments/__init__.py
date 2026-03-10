@@ -146,7 +146,6 @@ class AuxiliaryParams(ParamGroup):
             7_000,
             30_000,
         ]  # Iterations at which to run test evaluation
-
         # self.test_iterations = list(range(10, 1001, 10)) + [7_000, 30_000]  # Test every 10 iterations up to 1000, then at 7k and 30k
 
         self.save_iterations = []  # Iterations at which to save model
@@ -161,7 +160,15 @@ class AuxiliaryParams(ParamGroup):
         # ====================================================================
         # HARDWARE & DEVICE
         # ====================================================================
-        self.gpu = 0  # GPU device ID to use
+        self.gpu = 0  # GPU device ID to use (primary GPU in multi-GPU mode)
+        
+        # Multi-GPU Distributed Data Parallel (DDP)
+        self.enable_distributed = False  # Enable DDP training
+        self.world_size = 1  # Total number of processes
+        self.rank = -1  # Process rank (auto-set by torchrun)
+        self.local_rank = -1  # Local GPU rank (auto-set by torchrun)
+        self.dist_backend = "nccl"  # Distributed backend
+        self.dist_url = "env://"  # Distributed init URL
 
         # ====================================================================
         # DATASET-SPECIFIC FLAGS
