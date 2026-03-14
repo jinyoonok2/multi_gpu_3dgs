@@ -60,11 +60,16 @@ from strategies.no_offload import (
     baseline_accumGrads_impl,
     baseline_accumGrads_micro_step,
 )
-from strategies.multi_gpu import (
-    GaussianModelMultiGPU,
-    multi_gpu_train_one_batch,
-    multi_gpu_eval_one_cam,
-)
+try:
+    from strategies.multi_gpu import (
+        GaussianModelMultiGPU,
+        multi_gpu_train_one_batch,
+        multi_gpu_eval_one_cam,
+    )
+except ModuleNotFoundError:
+    GaussianModelMultiGPU = None
+    multi_gpu_train_one_batch = None
+    multi_gpu_eval_one_cam = None
 from strategies.multi_gpu_clm import (
     GaussianModelMultiGPUCLM,
     multi_gpu_clm_train_one_batch,
