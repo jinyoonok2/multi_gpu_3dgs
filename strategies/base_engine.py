@@ -61,16 +61,13 @@ def calculate_filters(batched_cameras, xyz_gpu, opacity_gpu, scaling_gpu, rotati
             # compensations
         ) = proj_results
 
-        output, counts = torch.unique_consecutive(camera_ids, return_counts=True)
-        assert torch.all(
-            output == torch.arange(len(batched_cameras)).cuda()
-        ), "Here we assume every camera sees at least one gaussian. This error can be caused by the fact that some cameras see no gaussians."
-        # TODO: here we assume every camera sees at least one gaussian.
-        counts_cpu = counts.cpu().numpy().tolist()
-        assert (
-            sum(counts_cpu) == gaussian_ids.shape[0]
-        ), "sum(counts_cpu) is supposed to be equal to gaussian_ids.shape[0]"
-        gaussian_ids_per_camera = torch.split(gaussian_ids, counts_cpu)
+        # Build per-camera filter lists. Some cameras may see 0 Gaussians after
+        # pruning (e.g. right after opacity reset), so we cannot assume every
+        # camera_id appears in the packed output. Handle this explicitly.
+        n_cameras = len(batched_cameras)
+        gaussian_ids_per_camera = tuple(
+            gaussian_ids[camera_ids == cam_id] for cam_id in range(n_cameras)
+        )
 
     filters = gaussian_ids_per_camera  # on GPU
     return filters, camera_ids, gaussian_ids

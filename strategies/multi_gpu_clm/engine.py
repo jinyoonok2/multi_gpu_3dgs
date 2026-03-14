@@ -334,6 +334,12 @@ def multi_gpu_clm_train_one_batch(
         n_vis = this_filter.shape[0]
 
         if n_vis == 0:
+            # M3: still must participate in AllGather collectives to avoid deadlock
+            if args.enable_p2p_caching and world_size > 1:
+                _collaborative_sh_fetch(
+                    gaussians, this_filter, n_vis, comm_stream,
+                    grid_size, block_size, rank, world_size,
+                )
             torch.cuda.nvtx.range_pop()
             continue
 
