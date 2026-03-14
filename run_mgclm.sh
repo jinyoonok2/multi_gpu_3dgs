@@ -1,8 +1,8 @@
 #!/bin/bash
 # Multi-GPU CLM training on 2 GPUs.
 # Usage:
-#   sbatch run_mgclm.sh a40             # M1 on 2x A40
-#   sbatch run_mgclm.sh a100            # M1 on 2x A100
+#   sbatch run_mgclm.sh a40             # M1 on 2x A40  (jaguar06: gpu:a40, or jaguar01: gpu:nvidia_a40)
+#   sbatch run_mgclm.sh a100            # M1 on 2x A100 (cheetah04: gpu:a100, or cheetah01: gpu:nvidia_a100-pcie-40gb)
 #   sbatch run_mgclm.sh a40  --p2p      # M1+M3 on 2x A40
 #   sbatch run_mgclm.sh a100 --p2p      # M1+M3 on 2x A100
 #
@@ -19,10 +19,14 @@ set -e
 # ---- Parse arguments ----
 GPU_CHOICE="${1:-a40}"
 case "${GPU_CHOICE}" in
-    a40)  GRES="gpu:a40:2" ;;
-    a100) GRES="gpu:a100:2" ;;
-    *)    echo "Usage: sbatch run_mgclm.sh {a40|a100} [--p2p]"; exit 1 ;;
+    a40)  GRES="gpu:a40:2" ;;          # jaguar06
+    nvidia_a40)  GRES="gpu:nvidia_a40:2" ;;   # jaguar01
+    a100) GRES="gpu:a100:2" ;;         # cheetah04
+    nvidia_a100) GRES="gpu:nvidia_a100-pcie-40gb:2" ;;  # cheetah01
+    *)    echo "Usage: sbatch run_mgclm.sh {a40|nvidia_a40|a100|nvidia_a100} [--p2p]"; exit 1 ;;
 esac
+# Normalize GPU_CHOICE to a40/a100 for output directory naming
+GPU_TAG=$(echo "${GPU_CHOICE}" | sed 's/nvidia_//')
 
 P2P_FLAG=""
 MODE_TAG="m1"
@@ -70,4 +74,4 @@ torchrun \
     --bsz 8 \
     --eval \
     ${P2P_FLAG} \
-    -m "output/rubble_${GPU_CHOICE}_x${NUM_GPUS}_${MODE_TAG}"
+    -m "output/rubble_${GPU_TAG}_x${NUM_GPUS}_${MODE_TAG}"

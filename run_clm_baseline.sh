@@ -1,8 +1,8 @@
 #!/bin/bash
 # CLM baseline: single-GPU CLM offload training.
 # Usage:
-#   sbatch run_clm_baseline.sh a40      # 1x A40
-#   sbatch run_clm_baseline.sh a100     # 1x A100
+#   sbatch run_clm_baseline.sh a40           # 1x A40  (jaguar06: gpu:a40, or jaguar01: gpu:nvidia_a40)
+#   sbatch run_clm_baseline.sh a100          # 1x A100 (cheetah04: gpu:a100, or cheetah01: gpu:nvidia_a100-pcie-40gb)
 #
 #SBATCH --output=./slurm/slurm%j.out
 #SBATCH --error=./slurm/slurm%j.err
@@ -17,10 +17,14 @@ set -e
 # ---- Parse arguments ----
 GPU_CHOICE="${1:-a40}"
 case "${GPU_CHOICE}" in
-    a40)  GRES="gpu:a40:1" ;;
-    a100) GRES="gpu:a100:1" ;;
-    *)    echo "Usage: sbatch run_clm_baseline.sh {a40|a100}"; exit 1 ;;
+    a40)  GRES="gpu:a40:1" ;;          # jaguar06
+    nvidia_a40)  GRES="gpu:nvidia_a40:1" ;;   # jaguar01
+    a100) GRES="gpu:a100:1" ;;         # cheetah04
+    nvidia_a100) GRES="gpu:nvidia_a100-pcie-40gb:1" ;;  # cheetah01
+    *)    echo "Usage: sbatch run_clm_baseline.sh {a40|nvidia_a40|a100|nvidia_a100}"; exit 1 ;;
 esac
+# Normalize GPU_CHOICE to a40/a100 for output directory naming
+GPU_TAG=$(echo "${GPU_CHOICE}" | sed 's/nvidia_//')
 
 # Re-submit with correct --gres if run directly
 if [[ -z "$SLURM_JOB_ID" ]]; then
@@ -49,4 +53,4 @@ python train.py \
     --clm_offload \
     --bsz 8 \
     --eval \
-    -m "output/rubble_${GPU_CHOICE}_clm"
+    -m "output/rubble_${GPU_TAG}_clm"
