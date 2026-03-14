@@ -568,14 +568,18 @@ def multi_gpu_clm_train_one_batch(
     # ==================================================================
     # STAGE 7: Gather losses across ranks for logging
     # ==================================================================
-    if world_size > 1 and len(losses) > 0:
-        local_losses = torch.stack(losses)
-        all_loss_list = [
-            torch.zeros_like(local_losses) for _ in range(world_size)
-        ]
-        dist.all_gather(all_loss_list, local_losses)
-        all_losses = torch.cat(all_loss_list)
-        losses = list(all_losses.unbind())
+    # Use a fixed-size tensor (cams_per_gpu elements) so both ranks ALWAYS call
+    # all_gather symmetrically. Cameras with n_vis==0 are skipped in the loop
+    # above (no loss appended), so they get a 0.0 placeholder here. This avoids
+    # the NCCL deadlock caused by the conditional `len(losses) > 0` guard which
+    # makes ranks diverge in their NCCL op sequence numbers.
+    if world_size > 1:
+        local_loss_tensor = torch.zeros(cams_per_gpu, device="cuda")
+        for i, l in enumerate(losses):
+            local_loss_tensor[i] = l.float()
+        all_loss_list = [torch.zeros(cams_per_gpu, device="cuda") for _ in range(world_size)]
+        dist.all_gather(all_loss_list, local_loss_tensor)
+        losses = list(torch.cat(all_loss_list).unbind())
 
     return losses, list(range(bsz)), [1.0] * bsz
 
