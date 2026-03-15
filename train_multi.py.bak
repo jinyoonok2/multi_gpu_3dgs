@@ -312,15 +312,6 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     ):
         # # rewrite the checking iterations
         # ------------------------------------------------------------------------
-        # 2.0: Synchronize ranks before each iteration
-        # ------------------------------------------------------------------------
-        # FIX: Without this barrier, ranks drift apart in iteration count.
-        # When one rank enters a densification block (calling dist.barrier/all_reduce)
-        # while the other skips it, NCCL deadlocks. This keeps them aligned.
-        if args.enable_distributed and args.world_size > 1:
-            dist.barrier()
-
-        # ------------------------------------------------------------------------
         # 2.1: Iteration setup and profiling
         # ------------------------------------------------------------------------
         # Optional: trace CUDA memory usage for debugging
