@@ -119,8 +119,19 @@ def inc_densify_iter():
     DENSIFY_ITER += 1
 
 
-def print_rank_0(str):
-    print(str)
+def print_rank_0(message):
+    try:
+        args = get_args()
+        if (
+            args is not None
+            and getattr(args, "enable_distributed", False)
+            and getattr(args, "rank", 0) != 0
+        ):
+            return
+    except Exception:
+        # Fall back to printing if global args are not initialized yet.
+        pass
+    print(message)
 
 
 def check_enable_python_timer():

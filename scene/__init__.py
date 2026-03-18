@@ -162,7 +162,11 @@ class Scene:
 
         self.decode_dataset_path = os.path.join(args.decode_dataset_path, "dataset_raw")
 
-        is_rank_0 = getattr(args, 'rank', 0) == 0
+        # In single-GPU training, args.rank may stay at -1.
+        # Treat non-distributed runs as main process so predecode is not skipped.
+        is_rank_0 = (not getattr(args, "enable_distributed", False)) or (
+            getattr(args, "rank", 0) == 0
+        )
         do_decode = False
         if is_rank_0:
             if not os.path.isdir(self.decode_dataset_path):

@@ -2,10 +2,16 @@ import torch
 import utils.general_utils as utils
 
 
-def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
+def gsplat_densification(
+    iteration, scene, gaussians, batched_screenspace_pkg, iteration_step=None
+):
     args = utils.get_args()
     timers = utils.get_timers()
     log_file = utils.get_log_file()
+    # In train_multi, iteration advances by per-GPU batch size (iteration_step),
+    # while args.bsz is the global batch size. Use iteration_step for schedule
+    # checks to avoid unintended double-trigger windows in distributed runs.
+    schedule_step = args.bsz if iteration_step is None else iteration_step
 
     # Densification
     if not args.disable_auto_densification and iteration <= args.densify_until_iter:
@@ -13,7 +19,7 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
         timers.start("densification")
 
         if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
-            iteration, args.bsz, args.densification_interval, 0
+            iteration, schedule_step, args.densification_interval, 0
         ):
             assert (
                 args.stop_update_param == False
@@ -34,21 +40,44 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
             # All GPUs will see identical stats → make identical decisions → N stays equal.
             if args.enable_distributed and args.world_size > 1:
                 import torch.distributed as dist
-                
+
                 torch.cuda.synchronize()
                 dist.barrier()  # Ensure all GPUs reach densification point
-                
+
                 # All-reduce xyz_gradient_accum (sum across GPUs, then average)
                 dist.all_reduce(gaussians.xyz_gradient_accum, op=dist.ReduceOp.SUM)
                 gaussians.xyz_gradient_accum /= args.world_size
-                
+
                 # All-reduce denom (sum across GPUs, then average)
                 dist.all_reduce(gaussians.denom, op=dist.ReduceOp.SUM)
                 gaussians.denom /= args.world_size
-                
+
                 # All-reduce max_radii2D (take max across GPUs)
                 dist.all_reduce(gaussians.max_radii2D, op=dist.ReduceOp.MAX)
-                
+
+                # Mode 2: rank-0 canonical synchronization for better consistency.
+                # Rank 0 becomes the source of truth for reduced stats and RNG seed
+                # used by densification sampling, then all ranks replay the same step.
+                if getattr(args, "densification_mode", 1) == 2:
+                    dist.broadcast(gaussians.xyz_gradient_accum, src=0)
+                    dist.broadcast(gaussians.denom, src=0)
+                    dist.broadcast(gaussians.max_radii2D, src=0)
+
+                    densify_seed = torch.zeros(1, device=gaussians.device, dtype=torch.int64)
+                    if args.rank == 0:
+                        densify_seed = torch.randint(
+                            0,
+                            2**31 - 1,
+                            (1,),
+                            device=gaussians.device,
+                            dtype=torch.int64,
+                        )
+                    dist.broadcast(densify_seed, src=0)
+                    seed = int(densify_seed.item())
+                    torch.manual_seed(seed)
+                    torch.cuda.manual_seed(seed)
+                    torch.cuda.manual_seed_all(seed)
+
                 dist.barrier()  # Ensure stats are synced before densification
 
             timers.start("densify_and_prune")
@@ -68,7 +97,7 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
             utils.inc_densify_iter()
 
         if utils.check_update_at_this_iter(
-            iteration, args.bsz, args.opacity_reset_interval, 0
+            iteration, schedule_step, args.opacity_reset_interval, 0
         ):
             # Synchronize before reset_opacity to ensure consistency
             if args.enable_distributed and args.world_size > 1:
@@ -87,7 +116,7 @@ def gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg):
         timers.stop("densification")
     else:
         if iteration > args.densify_from_iter and utils.check_update_at_this_iter(
-            iteration, args.bsz, args.densification_interval, 0
+            iteration, schedule_step, args.densification_interval, 0
         ):
             utils.check_memory_usage(
                 log_file, args, iteration, gaussians, before_densification_stop=False

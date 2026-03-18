@@ -418,7 +418,6 @@ def clm_offload_train_one_batch(
     else:
         gaussians.signal_tensor_pinned.zero_()
     signal_tensor_pinned = gaussians.signal_tensor_pinned  # does not help.
-    torch.cuda.synchronize()  # does not help.
 
     microbatch_idx = 0
     
@@ -880,35 +879,33 @@ def clm_offload_train_one_batch(
     # to ensure gradients are fully accumulated before synchronization
     if args.enable_distributed and args.world_size > 1:
         import torch.distributed as dist
-        
-        # CRITICAL: Barrier to ensure ALL GPUs reach this point before all_reduce
-        # Prevents timeout if one GPU is slower
-        torch.cuda.synchronize()  # Ensure all GPU work is done
-        dist.barrier()  # Wait for all processes
-        
+
         torch.cuda.nvtx.range_push("all_reduce all gradients")
         
         # Sync GPU parameters gradients (xyz, opacity, scaling, rotation)
-        for param in gaussians.all_parameters()[:4]:
-            if param.grad is not None:
-                dist.all_reduce(param.grad, op=dist.ReduceOp.SUM)
+        gpu_grads = [
+            param.grad for param in gaussians.all_parameters()[:4] if param.grad is not None
+        ]
+        if len(gpu_grads) > 0:
+            try:
+                dist.all_reduce_coalesced(gpu_grads, op=dist.ReduceOp.SUM)
+            except Exception:
+                # Fallback for environments without coalesced all-reduce support.
+                for grad in gpu_grads:
+                    dist.all_reduce(grad, op=dist.ReduceOp.SUM)
         
         # Sync CPU parameters gradients (SH coefficients in pinned memory)
         # NCCL doesn't support CPU tensors, so we copy to GPU, sync, then copy back
         torch.cuda.nvtx.range_push("sync CPU gradients")
         cpu_grad_gpu = parameters_grad_buffer[:N, :].cuda(non_blocking=True)
-        torch.cuda.synchronize()
         dist.all_reduce(cpu_grad_gpu, op=dist.ReduceOp.SUM)
-        parameters_grad_buffer[:N, :].copy_(cpu_grad_gpu, non_blocking=True)
+        # Use blocking copy-back to avoid an extra explicit device synchronize.
+        parameters_grad_buffer[:N, :].copy_(cpu_grad_gpu, non_blocking=False)
         del cpu_grad_gpu
-        torch.cuda.synchronize()
         torch.cuda.nvtx.range_pop()
         
         torch.cuda.nvtx.range_pop()
-        
-        # Another barrier after all_reduce to ensure consistency
-        dist.barrier()
-        
+
         # NOW we can start CPU Adam thread with synchronized gradients
         cpuadam_worker = threading.Thread(
             target=cpuadam_thread,

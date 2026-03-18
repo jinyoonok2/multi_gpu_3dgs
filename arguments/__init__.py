@@ -235,6 +235,10 @@ class OptimizationParams(ParamGroup):
         self.densify_until_iter = 15_000
         self.densify_grad_threshold = 0.0002
         self.disable_auto_densification = False
+        # Densification mode for distributed training:
+        # 1 = replicated densification with all-reduced stats (default)
+        # 2 = rank-0-canonical replicated densification (broadcast canonical stats + densify seed)
+        self.densification_mode = 1
         self.random_background = False
         self.min_opacity = 0.005
         self.lr_scale_mode = "sqrt"  # can be "linear", "sqrt", or "accumu"

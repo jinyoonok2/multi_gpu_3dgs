@@ -119,6 +119,35 @@ class GaussianModelCLMOffload(BaseGaussianModel):
             self._parameters,
         ]
 
+    def _ensure_parameters_buffer_capacity(self, required_rows, copy_rows):
+        current_capacity = self.parameters_buffer.shape[0]
+        if required_rows <= current_capacity:
+            return
+
+        new_capacity = max(required_rows, int(current_capacity * 1.5))
+        utils.get_log_file().write(
+            f"Growing prealloc_capacity from {current_capacity} to {new_capacity}\\n"
+        )
+
+        new_parameters_buffer_array = numba.cuda.pinned_array(
+            (new_capacity, 48), dtype=np.float32
+        )
+        new_parameters_buffer = torch.from_numpy(new_parameters_buffer_array)
+        new_parameters_buffer[:copy_rows].copy_(self.parameters_buffer[:copy_rows])
+        self.parameters_buffer = new_parameters_buffer
+        assert self.parameters_buffer.is_pinned()
+
+        if hasattr(self, "parameters_grad_buffer") and self.parameters_grad_buffer.numel():
+            new_parameters_grad_buffer_array = numba.cuda.pinned_array(
+                (new_capacity, 48), dtype=np.float32
+            )
+            new_parameters_grad_buffer = torch.from_numpy(new_parameters_grad_buffer_array)
+            new_parameters_grad_buffer[:copy_rows].copy_(
+                self.parameters_grad_buffer[:copy_rows]
+            )
+            self.parameters_grad_buffer = new_parameters_grad_buffer
+            assert self.parameters_grad_buffer.is_pinned()
+
     def training_setup(self, training_args):
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros(
@@ -686,6 +715,7 @@ class GaussianModelCLMOffload(BaseGaussianModel):
                 # Update parameters.
                 N = group["params"][0].shape[0]
                 N_ext = extension_tensor.shape[0]
+                # self._ensure_parameters_buffer_capacity(N + N_ext, N)
                 self.parameters_buffer[N : (N + N_ext)] = extension_tensor
                 group["params"][0] = nn.Parameter(
                     self.parameters_buffer[: (N + N_ext)].requires_grad_(True)

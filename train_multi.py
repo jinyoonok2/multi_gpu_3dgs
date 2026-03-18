@@ -111,6 +111,16 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             opt_args.densification_interval = max(1, int(opt_args.densification_interval * scale_factor))
             opt_args.position_lr_max_steps = int(opt_args.position_lr_max_steps * scale_factor)
             opt_args.opacity_reset_interval = int(opt_args.opacity_reset_interval * scale_factor)
+
+            # Keep global args in sync with scaled optimization schedule.
+            # Densification helpers read from utils.get_args(), not opt_args.
+            args.iterations = opt_args.iterations
+            args.densify_from_iter = opt_args.densify_from_iter
+            args.densify_until_iter = opt_args.densify_until_iter
+            args.densification_interval = opt_args.densification_interval
+            args.opacity_reset_interval = opt_args.opacity_reset_interval
+            args.position_lr_max_steps = opt_args.position_lr_max_steps
+
             args.test_iterations = [int(x * scale_factor) for x in args.test_iterations]
             args.save_iterations = [int(x * scale_factor) for x in args.save_iterations]
             args.checkpoint_iterations = [int(x * scale_factor) for x in args.checkpoint_iterations]
@@ -125,6 +135,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 print(f"Iterations: {opt_args.iterations} (scaled from 30000)")
                 print(f"Densify until: {opt_args.densify_until_iter} (scaled from 15000)")
                 print(f"Test iterations: {args.test_iterations}")
+                print(f"Densification mode: {getattr(args, 'densification_mode', 1)}")
                 print(f"Total images seen: {opt_args.iterations * args.bsz}")
                 print(f"{'='*60}\n")
         
@@ -264,6 +275,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         pin_memory=True,  # Enable faster GPU transfers
         collate_fn=(lambda batch: batch),
     )
+    sampler_epoch = 0
+    if sampler is not None:
+        sampler.set_epoch(sampler_epoch)
     dataloader_iter = iter(dataloader)
 
     # ------------------------------------------------------------------------
@@ -372,6 +386,9 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             batched_cameras = next(dataloader_iter)
         except StopIteration:
             # Reached end of dataset, restart from beginning
+            if sampler is not None:
+                sampler_epoch += 1
+                sampler.set_epoch(sampler_epoch)
             dataloader_iter = iter(dataloader)
             batched_cameras = next(dataloader_iter)
         timers.stop("dataloader: load the next image from disk and decode")
@@ -548,20 +565,31 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
             # 2.6: Periodic evaluation on validation set
             # ------------------------------------------------------------------------
             end2end_timers.stop()
-            training_report(
-                iteration,
-                l1_loss,
-                args.test_iterations,
-                scene,
-                pipe_args,
-                background,
-            )
+            if args.enable_distributed:
+                dist.barrier()
+            if args.rank == 0:
+                training_report(
+                    iteration,
+                    l1_loss,
+                    args.test_iterations,
+                    scene,
+                    pipe_args,
+                    background,
+                )
+            if args.enable_distributed:
+                dist.barrier()
             end2end_timers.start()
 
             # ------------------------------------------------------------------------
             # 2.7: Adaptive densification (add/split/prune gaussians)
             # ------------------------------------------------------------------------
-            gsplat_densification(iteration, scene, gaussians, batched_screenspace_pkg)
+            gsplat_densification(
+                iteration,
+                scene,
+                gaussians,
+                batched_screenspace_pkg,
+                iteration_step=iteration_step,
+            )
 
             # Perform actual densification at specified intervals
             if (
@@ -593,25 +621,33 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     for save_iteration in args.save_iterations
                 ]
             ):
-                utils.print_rank_0("\n[ITER {}] Saving End2end".format(iteration))
-                end2end_timers.stop()
-                end2end_timers.print_time(log_file, iteration + iteration_step)
+                if args.enable_distributed:
+                    dist.barrier()
+                if args.rank == 0:
+                    utils.print_rank_0("\n[ITER {}] Saving End2end".format(iteration))
+                    end2end_timers.stop()
+                    end2end_timers.print_time(log_file, iteration + iteration_step)
 
-                if not args.do_not_save:
-                    utils.print_rank_0("\n[ITER {}] Saving Gaussians".format(iteration))
-                    log_file.write("[ITER {}] Saving Gaussians\n".format(iteration))
+                    if not args.do_not_save:
+                        utils.print_rank_0("\n[ITER {}] Saving Gaussians".format(iteration))
+                        log_file.write("[ITER {}] Saving Gaussians\n".format(iteration))
 
-                    if args.save_tensors:
-                        # Save as PyTorch tensors (.pt format) for faster loading
-                        utils.print_rank_0(
-                            "NOTE: Saving model as .pt files instead of .ply file."
-                        )
-                        scene.save_tensors(iteration)
-                    else:
-                        # Save as PLY point cloud (standard format)
-                        scene.save(iteration)
+                        if args.save_tensors:
+                            # Save as PyTorch tensors (.pt format) for faster loading
+                            utils.print_rank_0(
+                                "NOTE: Saving model as .pt files instead of .ply file."
+                            )
+                            scene.save_tensors(iteration)
+                        else:
+                            # Save as PLY point cloud (standard format)
+                            scene.save(iteration)
 
-                end2end_timers.start()
+                    end2end_timers.start()
+                if args.enable_distributed:
+                    dist.barrier()
+
+                if args.rank != 0:
+                    end2end_timers.start()
 
             # ------------------------------------------------------------------------
             # 2.10: Save training checkpoint (for resuming)
@@ -622,20 +658,28 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                     for checkpoint_iteration in args.checkpoint_iterations
                 ]
             ):
-                end2end_timers.stop()
-                utils.print_rank_0("\n[ITER {}] Saving Checkpoint".format(iteration))
-                log_file.write("[ITER {}] Saving Checkpoint\n".format(iteration))
+                if args.enable_distributed:
+                    dist.barrier()
+                if args.rank == 0:
+                    end2end_timers.stop()
+                    utils.print_rank_0("\n[ITER {}] Saving Checkpoint".format(iteration))
+                    log_file.write("[ITER {}] Saving Checkpoint\n".format(iteration))
 
-                save_folder = scene.model_path + "/checkpoints/" + str(iteration) + "/"
-                os.makedirs(save_folder, exist_ok=True)
-                torch.save(
-                    (
-                        gaussians.capture(),
-                        iteration + iteration_step,
-                    ),  # Model state + iteration number
-                    save_folder + "/chkpnt.pth",
-                )
-                end2end_timers.start()
+                    save_folder = scene.model_path + "/checkpoints/" + str(iteration) + "/"
+                    os.makedirs(save_folder, exist_ok=True)
+                    torch.save(
+                        (
+                            gaussians.capture(),
+                            iteration + iteration_step,
+                        ),  # Model state + iteration number
+                        save_folder + "/chkpnt.pth",
+                    )
+                    end2end_timers.start()
+                if args.enable_distributed:
+                    dist.barrier()
+
+                if args.rank != 0:
+                    end2end_timers.start()
 
             # ------------------------------------------------------------------------
             # 2.11: Optimizer step (for non-overlapped strategies only)
@@ -975,12 +1019,14 @@ if __name__ == "__main__":
     init_args(args)
 
     args = utils.get_args()
+    startup_rank = int(os.environ.get("RANK", 0)) if args.enable_distributed else 0
 
     # create log folder
     os.makedirs(args.log_folder, exist_ok=True)
     os.makedirs(args.model_path, exist_ok=True)
-    with open(args.log_folder + "/args.json", "w") as f:
-        json.dump(vars(args), f)
+    if startup_rank == 0:
+        with open(args.log_folder + "/args.json", "w") as f:
+            json.dump(vars(args), f)
 
     # create cuda trace dump folder
     if args.trace_cuda_mem:
@@ -991,9 +1037,10 @@ if __name__ == "__main__":
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
 
     # Initialize log file and print all args
+    log_file_name = "python.log" if startup_rank == 0 else f"python_rank{startup_rank}.log"
     log_file = open(
-        args.log_folder + "/python.log",
-        "a" if args.auto_start_checkpoint else "w",
+        args.log_folder + "/" + log_file_name,
+        "a" if args.auto_start_checkpoint or startup_rank != 0 else "w",
     )
     utils.set_log_file(log_file)
     print_all_args(args, log_file)

@@ -94,6 +94,34 @@ def loadCam_raw_from_disk(args, id, cam_info, to_gpu=False):
             "rb",
         ) as raw_file:
             raw_data = raw_file.read()
+
+    # # Get decoded gt_image from disk.
+    # # If the raw file is missing (e.g. partial/incomplete predecode),
+    # # decode it on demand from the source image and cache it.
+    # raw_data_path = os.path.join(
+    #     args.decode_dataset_path,
+    #     "dataset_raw",
+    #     (cam_info.image_name.lstrip("/") + ".raw"),
+    # )
+    # expected_raw_bytes = orig_h * orig_w * 3
+
+    # try:
+    #     with open(raw_data_path, "rb") as raw_file:
+    #         raw_data = raw_file.read()
+    #     if len(raw_data) != expected_raw_bytes:
+    #         raise ValueError(
+    #             f"Incomplete raw file: {raw_data_path} "
+    #             f"(got {len(raw_data)} bytes, expected {expected_raw_bytes})"
+    #         )
+    # except (FileNotFoundError, ValueError):
+    #     # Keep the original decode procedure unchanged.
+    #     os.makedirs(os.path.dirname(raw_data_path), exist_ok=True)
+    #     img = Image.open(cam_info.image_path)
+    #     img = img.crop((0, 0, orig_w, orig_h))
+    #     raw_data = img.tobytes()
+    #     img.close()
+    #     with open(raw_data_path, "wb+") as raw_file:
+    #         raw_file.write(raw_data)
     except RuntimeError as e:
         raise RuntimeError(e)
 
