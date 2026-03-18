@@ -169,6 +169,8 @@ class AuxiliaryParams(ParamGroup):
         self.local_rank = -1  # Local GPU rank (auto-set by torchrun)
         self.dist_backend = "nccl"  # Distributed backend
         self.dist_url = "env://"  # Distributed init URL
+        self.p2p_fetch = False  # Enable GPU-to-GPU P2P SH sharing via NVLink/NCCL
+        self.overlap_schedule = False  # Enable dual-stream overlapped prefetch/offload
 
         # ====================================================================
         # DATASET-SPECIFIC FLAGS

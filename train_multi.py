@@ -191,19 +191,26 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         # Automatically calculate prealloc_capacity if not specified
         if args.prealloc_capacity == -1:
             # Get available CPU memory in bytes
-            available_memory = psutil.virtual_memory().available
+            # Use SLURM memory limit if available (psutil may report full node memory)
+            slurm_mem_mb = os.environ.get('SLURM_MEM_PER_NODE')
+            if slurm_mem_mb is not None:
+                available_memory = int(slurm_mem_mb) * 1024 * 1024  # MB to bytes
+            else:
+                available_memory = psutil.virtual_memory().available
+            n_procs = args.world_size
 
-            # Calculate capacity using formula: (remaining CPU memory × 0.7) / (48 × 4 × 4 bytes)
+            # Calculate capacity using formula: (remaining CPU memory × 0.7) / (48 × 4 × 4 bytes) / n_procs
             # 48 = spherical harmonic coefficients, 4 = bytes per float32, 4 = (param + grad + 2 optimizer states)
+            # Divide by n_procs because each process allocates its own buffer from shared system RAM
             args.prealloc_capacity = (
-                int((available_memory * 0.7) / (48 * 4 * 4)) // 16 * 16
+                int((available_memory * 0.7) / (48 * 4 * 4) / n_procs) // 16 * 16
             )  # round to the nearest multiple of 16
 
             utils.print_rank_0(
-                f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians ({available_memory / (1024**3):.2f} GB available CPU memory)"
+                f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians ({available_memory / (1024**3):.2f} GB available CPU memory, {n_procs} processes)"
             )
             log_file.write(
-                f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians ({available_memory / (1024**3):.2f} GB available CPU memory)\n"
+                f"Auto-calculated prealloc_capacity: {args.prealloc_capacity:,} Gaussians ({available_memory / (1024**3):.2f} GB available CPU memory, {n_procs} processes)\n"
             )
         gaussians = GaussianModelCLMOffload(sh_degree=dataset_args.sh_degree)
         utils.print_rank_0("Using GaussianModelCLMOffload")
@@ -291,6 +298,17 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
     # Dedicated stream for CPU↔GPU communication (overlapped with compute)
     comm_stream = torch.cuda.Stream(device=args.gpu, priority=args.comm_stream_priority)
+
+    # --- Create training strategy module (P2P / Overlap / baseline) ---
+    # Each strategy provides hook implementations that modify the unified
+    # engine at specific pipeline stages.  None = baseline (no extra hooks).
+    training_strategy = None
+    if args.p2p_fetch:
+        from strategies.clm_offload.p2p_module import P2PStrategy
+        training_strategy = P2PStrategy(args.rank, args.world_size)
+    elif args.overlap_schedule:
+        from strategies.clm_offload.overlap_module import OverlapStrategy
+        training_strategy = OverlapStrategy(args.gpu)
 
     # ------------------------------------------------------------------------
     # 1.5: Initialize training loop state
@@ -488,6 +506,8 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
             N = gaussians._xyz.shape[0]
 
+            # Unified call — the strategy object injects P2P / Overlap
+            # behaviour at the appropriate pipeline hook points.
             losses, ordered_cams, sparsity = clm_offload_train_one_batch(
                 gaussians,
                 scene,
@@ -497,6 +517,7 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 pipe_args,
                 comm_stream,
                 perm_generator,
+                strategy=training_strategy,  # None = baseline
             )
 
             batched_screenspace_pkg = {}
