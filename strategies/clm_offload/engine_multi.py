@@ -359,8 +359,23 @@ def clm_offload_train_one_batch(
     strategy : BaseStrategy or None
         Optional training strategy module (P2P, Overlap, etc.).
         When None, the baseline code path is used.
+
+    [MODIFIED vs master] Added `strategy` parameter. Master had no strategy
+    concept — all logic was inline. This version delegates to hook methods on
+    the strategy object. When strategy is BaseStrategy (default / baseline),
+    every hook is a no-op and the code path is functionally identical to master.
+
+    Hook call sites in this function (7 total):
+      Stage 1   — post_filters()          : P2P computes filter partitions
+      Stage 2   — (signal_tensor logic)   : async_allreduce changes allocation
+      Stage 3   — get_offload_stream()    : Overlap creates a 2nd CUDA stream
+      Stage 4.1 — load_first_shs()        : P2P does GPU-GPU broadcast
+      Stage 4.2 — pre_compute_offload()   : Overlap pre-computes G indices
+      Stage 4.3 — before_forward()        : Overlap syncs offload_stream
+      Stage 5.0 — pre_gradient_sync()     : Overlap does cuda.synchronize()
+                  sync_gradients()        : P2P uses custom p2p gradient sync
     """
-    # --- Strategy initialisation ---
+    # ── [ADDED vs master] Strategy initialisation ──
     # If no strategy is given, use the no-op baseline hooks.
     from strategies.clm_offload.strategy_base import BaseStrategy
     if strategy is None:
@@ -416,23 +431,38 @@ def clm_offload_train_one_batch(
     # cnt_g: count of parameters to GARBAGE (offload to CPU)
     torch.cuda.nvtx.range_pop()
 
-    # --- HOOK: post_filters (Stage 1) ---
-    # P2P uses this to compute filter partitions for cooperative GPU-GPU loading.
-    # Baseline and Overlap: no-op (returns empty dict).
+    # ── HOOK 1/7: post_filters (Stage 1) ──────────────────────────────────
+    # [ADDED vs master] This call did not exist in master.
+    # P2P: computes filter partitions for cooperative GPU-GPU SH loading.
+    # Baseline / Overlap: no-op → returns empty dict, no impact.
     extra_state = strategy.post_filters(args, filters, n_gaussians, iteration, log_file)
+    # ── END HOOK 1 ────────────────────────────────────────────────────────
 
     # ============================================================================
     # STAGE 2: CONCURRENT CPU THREAD INITIALIZATION
     # ============================================================================
     # Start a background thread to perform CPU Adam updates asynchronously
     # This overlaps CPU optimization with GPU computation
-    if not hasattr(gaussians, "signal_tensor_pinned"):
+    #
+    # [MODIFIED vs master] Signal tensor allocation.
+    # Master: unconditionally did `if not hasattr ... else .zero_()`.
+    # We wrap in an if/else on async_allreduce:
+    #   - async mode: always allocate a FRESH tensor (the previous iteration's
+    #     deferred cpuadam may still be reading the old one).
+    #   - non-async (baseline): same logic as master (reuse & zero).
+    if args.async_allreduce:
         gaussians.signal_tensor_pinned = torch.zeros(
             bsz, dtype=torch.int32, device="cpu", pin_memory=True
         )
     else:
-        gaussians.signal_tensor_pinned.zero_()
-    signal_tensor_pinned = gaussians.signal_tensor_pinned  # does not help.
+        # Identical to master: reuse existing tensor or create on first call.
+        if not hasattr(gaussians, "signal_tensor_pinned"):
+            gaussians.signal_tensor_pinned = torch.zeros(
+                bsz, dtype=torch.int32, device="cpu", pin_memory=True
+            )
+        else:
+            gaussians.signal_tensor_pinned.zero_()
+    signal_tensor_pinned = gaussians.signal_tensor_pinned
 
     microbatch_idx = 0
     
@@ -473,16 +503,24 @@ def clm_offload_train_one_batch(
     # Stream management: default_stream for compute, comm_stream for CPU<->GPU transfers
     default_stream = torch.cuda.current_stream()
 
-    # --- HOOK: get_offload_stream (Stage 3) ---
-    # Overlap creates a dedicated CUDA stream for gradient offloading;
-    # Baseline and P2P reuse comm_stream (no extra stream overhead).
+    # ── HOOK 2/7: get_offload_stream (Stage 3) ────────────────────────────
+    # [ADDED vs master] Master had no offload_stream — it used comm_stream
+    # everywhere. We introduce offload_stream so Overlap can use a dedicated
+    # CUDA stream for gradient offloading (three-way overlap).
+    # Baseline / P2P: returns comm_stream itself → identical to master.
     offload_stream = strategy.get_offload_stream(comm_stream, args)
+    # ── END HOOK 2 ────────────────────────────────────────────────────────
 
     # Training loop variables
     num_micro_batches = len(batched_cameras)
     N = gaussians._xyz.shape[0]
     losses = []
     shs_retents = [None for i in range(num_micro_batches)]  # Retained SH coefficients
+    # [ADDED vs master] Keep-alive list: holds references to tensors being read
+    # by offload_stream, preventing Python GC from freeing GPU memory while
+    # async kernels are still using it.  Harmless in baseline (list stays empty
+    # or holds refs to tensors that would be alive anyway).
+    _offload_keepalive = []
 
     # Kernel launch parameters
     grid_size, block_size = args.grid_size_H, 256
@@ -501,9 +539,11 @@ def clm_offload_train_one_batch(
             (N,), dtype=torch.int32, device="cuda"
         )  # Index mapping
 
-    # Initialize SH gradient buffer on the offload stream.
-    # When offload_stream == comm_stream (baseline/P2P) this is equivalent
-    # to putting it in the block above.
+    # [MODIFIED vs master] shs_grad init moved to offload_stream.
+    # Master: shs_grad was initialised in the comm_stream block above.
+    # We initialise it on offload_stream so the event is recorded on the
+    # correct stream.  When offload_stream == comm_stream (baseline/P2P)
+    # this is equivalent to the original.
     with torch.cuda.stream(offload_stream), torch.no_grad():
         shs_grad = torch.zeros(
             filters[0].shape[0], 48, device="cuda"
@@ -518,7 +558,7 @@ def clm_offload_train_one_batch(
         torch.cuda.nvtx.range_push("micro_batch_idx: " + str(micro_idx))
         this_filter = filters[micro_idx]
         this_filter_len = this_filter.shape[0]
-        precomp_offload_data = {}  # filled by strategy hook in Stage 4.2
+        precomp_offload_data = {}  # [ADDED vs master] filled by strategy hook 4/7 in Stage 4.2
 
         # ------------------------------------------------------------------------
         # 4.1: Load current SH coefficients (CPU → GPU)
@@ -530,14 +570,17 @@ def clm_offload_train_one_batch(
                     this_filter_len, 48, device="cuda", requires_grad=True
                 )
 
-                # --- HOOK: load_first_shs (Stage 4.1) ---
-                # P2P: cooperative GPU-GPU SH sharing via NVLink.
-                # Baseline / Overlap: standard CPU → GPU via send_shs2gpu_stream.
+                # ── HOOK 3/7: load_first_shs (Stage 4.1) ──────────────────
+                # [MODIFIED vs master] Master called send_shs2gpu_stream()
+                # directly here.  We delegate to strategy.load_first_shs().
+                # P2P: cooperative GPU-GPU SH sharing via NVLink broadcast.
+                # Baseline / Overlap: calls send_shs2gpu_stream() — same as master.
                 strategy.load_first_shs(
                     shs, gaussians._parameters, filters[micro_idx],
                     n_gaussians, grid_size, block_size,
                     extra_state, args,
                 )
+                # ── END HOOK 3 ────────────────────────────────────────────
                 shs_retents[micro_idx] = shs.detach()
                 cpu2gpu_event = torch.cuda.Event(enable_timing=True)
                 cpu2gpu_event.record(comm_stream)
@@ -672,14 +715,17 @@ def clm_offload_train_one_batch(
                 shs_next.requires_grad_(True)
                 del host_indices_to_param, param_indices_from_host
 
-                # --- HOOK: pre_compute_offload (Stage 4.2) ---
-                # Overlap pre-computes Category G indices here so offload_stream
-                # can start as soon as backward finishes (three-way overlap).
-                # Baseline / P2P: no-op (G indices are computed inline in 4.6).
+                # ── HOOK 4/7: pre_compute_offload (Stage 4.2) ─────────────
+                # [ADDED vs master] This call did not exist in master.
+                # Overlap: pre-computes Category G indices on comm_stream so
+                # offload_stream can start immediately after backward (3-way
+                # overlap of compute / comm / offload).
+                # Baseline / P2P: no-op → returns {}, G indices computed in 4.6.
                 precomp_offload_data = strategy.pre_compute_offload(
                     micro_idx, comm_stream,
                     this_bit, next_bit, cnt_g, retention_vec,
                 )
+                # ── END HOOK 4 ────────────────────────────────────────────
 
                 next_cpu2gpu_event = torch.cuda.Event(enable_timing=True)
                 next_cpu2gpu_event.record(comm_stream)
@@ -687,11 +733,13 @@ def clm_offload_train_one_batch(
         # ------------------------------------------------------------------------
         # 4.3: Forward pass - Render image with filtered gaussian parameters
         # ------------------------------------------------------------------------
-        # --- HOOK: before_forward (Stage 4.3) ---
-        # Overlap waits for offload_stream to finish before running forward
-        # kernels on default_stream (prevents concurrent memory access).
+        # ── HOOK 5/7: before_forward (Stage 4.3) ──────────────────────────
+        # [ADDED vs master] This call did not exist in master.
+        # Overlap: waits for offload_stream to finish writing before forward
+        # kernels run on default_stream (prevents concurrent memory access).
         # Baseline / P2P: no-op.
         strategy.before_forward(default_stream)
+        # ── END HOOK 5 ────────────────────────────────────────────────────
 
         torch.cuda.nvtx.range_push("forward_pass")
         torch.cuda.nvtx.range_push("prepare filtered parameters")
@@ -813,24 +861,38 @@ def clm_offload_train_one_batch(
 
         # ------------------------------------------------------------------------
         # 4.6: Offload SH gradients back to CPU (GPU → CPU)
-        #      Uses offload_stream (== comm_stream for baseline/P2P,
-        #      a dedicated stream for Overlap — enabling three-way overlap).
+        # [MODIFIED vs master] Two changes:
+        #   1. Uses offload_stream instead of comm_stream.
+        #      Baseline/P2P: offload_stream == comm_stream → same as master.
+        #      Overlap: offload_stream is a separate CUDA stream → three-way
+        #      overlap of default_stream (compute), comm_stream (prefetch),
+        #      and offload_stream (grad offload).
+        #   2. Category G index computation is conditional:
+        #      If precomp_offload_data has pre-computed indices (Overlap hook
+        #      4/7 in Stage 4.2), use those; otherwise compute inline (master).
+        #   3. Added _offload_keepalive to prevent premature tensor dealloc.
+        #   4. Added next_cpu2gpu_event.wait(offload_stream) guard.
         # ------------------------------------------------------------------------
         if micro_idx < num_micro_batches - 1:
             # Non-final micro-batch: use retention-based selective gradient offloading
             with torch.cuda.stream(offload_stream), torch.no_grad():
+                # [ADDED vs master] Release previous keep-alive refs.
+                _offload_keepalive.clear()
+
                 # Reuse indices from prefetch step (Category D)
                 rtnt_indices_from_grad = (
                     param_indices_from_rtnt  # Category D: retained indices
                 )
                 grad_indices_to_rtnt = rtnt_indices_to_param
 
-                # Category G indices: use pre-computed (Overlap) or compute inline (Baseline/P2P)
+                # [MODIFIED vs master] Category G indices: conditional source.
+                # Overlap: use pre-computed indices from hook 4/7.
+                # Baseline / P2P: compute inline — same as master.
                 if "host_indices_from_grad" in precomp_offload_data:
                     host_indices_from_grad = precomp_offload_data["host_indices_from_grad"]
                     grad_indices_to_host = precomp_offload_data["grad_indices_to_host"]
                 else:
-                    # idx_g = torch.nonzero(this_bit & ~next_bit).flatten() # torch.nonzero() blocks cpu!!!
+                    # Same as master: compute Category G inline.
                     bit_g = this_bit & ~next_bit
                     idx_g = torch.nonzero_static(bit_g, size=cnt_g[micro_idx]).flatten()
                     host_indices_from_grad = idx_g.to(torch.int32)
@@ -839,9 +901,13 @@ def clm_offload_train_one_batch(
 
                 # Wait for backward pass to complete
                 gpu2cpu_event.wait(offload_stream)
-                # Overlap: also wait for pre-computed indices to be ready
+                # [ADDED vs master] Overlap: wait for pre-computed indices event.
                 if "indices_ready_event" in precomp_offload_data:
                     precomp_offload_data["indices_ready_event"].wait(offload_stream)
+                # [ADDED vs master] Wait for comm_stream to finish writing
+                # shs_next before reading its shape/data for zeros_like.
+                # Prevents illegal memory access when offload_stream ≠ comm_stream.
+                next_cpu2gpu_event.wait(offload_stream)
 
                 shs_retents[micro_idx] = None
                 shs_grad_next = torch.zeros_like(shs_next, device="cuda")
@@ -861,7 +927,18 @@ def clm_offload_train_one_batch(
                     grid_size_D,
                     block_size_D,
                 )
+
+                # [ADDED vs master] Keep tensors alive until offload_stream
+                # finishes reading them.  Without this, Python may GC the refs
+                # before the async GPU kernel runs, letting the allocator
+                # recycle the memory → illegal memory access.
+                _offload_keepalive = [
+                    shs_grad, host_indices_from_grad, rtnt_indices_from_grad,
+                    grad_indices_to_host, grad_indices_to_rtnt,
+                ]
+
                 shs_grad = shs_grad_next
+                # [MODIFIED vs master] Record on offload_stream, not comm_stream.
                 shs_grad_init_event.record(offload_stream)
 
                 # Signal CPU Adam thread that gradients are ready for this micro-batch
@@ -870,6 +947,7 @@ def clm_offload_train_one_batch(
 
         else:
             # Final micro-batch: offload all gradients to CPU
+            # [MODIFIED vs master] Uses offload_stream instead of comm_stream.
             with torch.cuda.stream(offload_stream), torch.no_grad():
                 gpu2cpu_event.wait(offload_stream)
 
@@ -929,21 +1007,30 @@ def clm_offload_train_one_batch(
     # ------------------------------------------------------------------------
     # CRITICAL: All-reduce must happen AFTER all micro-batches complete
     # to ensure gradients are fully accumulated before synchronization
+    # [ADDED vs master] async_state tracks deferred async all-reduce.
+    async_state = None  # Non-None only when async all-reduce is in flight
+
     if args.enable_distributed and args.world_size > 1:
         import torch.distributed as dist
 
-        # --- HOOK: pre_gradient_sync (Stage 5.0) ---
-        # Overlap does a full torch.cuda.synchronize() (both streams).
+        # ── HOOK 6/7: pre_gradient_sync (Stage 5.0) ──────────────────────
+        # [ADDED vs master] This call did not exist in master.
+        # Overlap: does torch.cuda.synchronize() to drain both streams.
         # Baseline / P2P: no-op.
         strategy.pre_gradient_sync()
+        # ── END HOOK 6 ────────────────────────────────────────────────────
 
-        # --- HOOK: sync_gradients (Stage 5.0) ---
-        # P2P uses P2PCommManager.sync_gradients_p2p() and returns True.
-        # Baseline / Overlap return False → use the default all-reduce below.
+        # ── HOOK 7/7: sync_gradients (Stage 5.0) ─────────────────────────
+        # [MODIFIED vs master] Master always ran the all-reduce block below.
+        # We first ask the strategy to handle gradient sync. If it returns
+        # True (P2P does custom p2p sync), we skip the default all-reduce.
+        # Baseline / Overlap return False → fall through to the all-reduce.
         if not strategy.sync_gradients(gaussians, parameters_grad_buffer, N, args):
+        # ── END HOOK 7 (wraps the all-reduce block below) ────────────────
             torch.cuda.nvtx.range_push("all_reduce all gradients")
 
             # Sync GPU parameters gradients (xyz, opacity, scaling, rotation)
+            # Always blocking — these are small GPU-resident tensors.
             gpu_grads = [
                 param.grad for param in gaussians.all_parameters()[:4] if param.grad is not None
             ]
@@ -957,32 +1044,60 @@ def clm_offload_train_one_batch(
 
             # Sync CPU parameters gradients (SH coefficients in pinned memory)
             # NCCL doesn't support CPU tensors, so we copy to GPU, sync, then copy back
+            #
+            # [MODIFIED vs master] Added async_allreduce branch.
+            # Master: always blocking (the `else` branch below).
+            # async mode: kicks off non-blocking all-reduce, returns handle
+            # in async_state → cpuadam deferred to next iteration.
             torch.cuda.nvtx.range_push("sync CPU gradients")
-            cpu_grad_gpu = parameters_grad_buffer[:N, :].cuda(non_blocking=True)
-            dist.all_reduce(cpu_grad_gpu, op=dist.ReduceOp.SUM)
-            # Use blocking copy-back to avoid an extra explicit device synchronize.
-            parameters_grad_buffer[:N, :].copy_(cpu_grad_gpu, non_blocking=False)
-            del cpu_grad_gpu
+            if args.async_allreduce:
+                # [ADDED vs master] Async path.
+                cpu_grad_gpu = parameters_grad_buffer[:N, :].cuda(non_blocking=False)
+                ar_handle = dist.all_reduce(cpu_grad_gpu, op=dist.ReduceOp.SUM, async_op=True)
+                async_state = {
+                    "handle": ar_handle,
+                    "cpu_grad_gpu": cpu_grad_gpu,
+                    "N": N,
+                    "total_samples": args.bsz * args.world_size,
+                    "cpuadam_args": (
+                        bsz, n_gaussians, signal_tensor_pinned,
+                        finish_indices_filters,
+                        gaussians.optimizer.cpu_adam,
+                        gaussians._parameters,
+                        parameters_grad_buffer[:n_gaussians, :],
+                        iteration, args,
+                    ),
+                }
+            else:
+                # Same as master: blocking all-reduce.
+                cpu_grad_gpu = parameters_grad_buffer[:N, :].cuda(non_blocking=True)
+                dist.all_reduce(cpu_grad_gpu, op=dist.ReduceOp.SUM)
+                parameters_grad_buffer[:N, :].copy_(cpu_grad_gpu, non_blocking=False)
+                del cpu_grad_gpu
             torch.cuda.nvtx.range_pop()
 
             torch.cuda.nvtx.range_pop()
 
-        # NOW we can start CPU Adam thread with synchronized gradients
-        cpuadam_worker = threading.Thread(
-            target=cpuadam_thread,
-            args=(
-                bsz,
-                n_gaussians,
-                signal_tensor_pinned,
-                finish_indices_filters,
-                gaussians.optimizer.cpu_adam,
-                gaussians._parameters,
-                parameters_grad_buffer[:n_gaussians, :],
-                iteration,
-                args,
-            ),
-        )
-        cpuadam_worker.start()
+        # [MODIFIED vs master] Start CPU Adam thread conditionally.
+        # Master: always started cpuadam_worker here.
+        # async mode: defers cpuadam to the start of the NEXT iteration
+        # (resolved in train_multi.py's _resolve_async_allreduce).
+        if async_state is None:
+            cpuadam_worker = threading.Thread(
+                target=cpuadam_thread,
+                args=(
+                    bsz,
+                    n_gaussians,
+                    signal_tensor_pinned,
+                    finish_indices_filters,
+                    gaussians.optimizer.cpu_adam,
+                    gaussians._parameters,
+                    parameters_grad_buffer[:n_gaussians, :],
+                    iteration,
+                    args,
+                ),
+            )
+            cpuadam_worker.start()
 
     # ------------------------------------------------------------------------
     # 5.1: GPU Adam optimizer step (for xyz, opacity, scaling, rotation)
@@ -993,8 +1108,10 @@ def clm_offload_train_one_batch(
         if param.grad is not None:
             param.grad /= total_samples
     
-    # Also scale CPU gradients
-    if args.enable_distributed and args.world_size > 1:
+    # [MODIFIED vs master] Scale CPU gradients.
+    # Master: always scaled here.  We skip when async_allreduce is active
+    # because the copy-back + scaling is deferred to the next iteration.
+    if async_state is None and args.enable_distributed and args.world_size > 1:
         parameters_grad_buffer[:N, :].div_(total_samples)
 
     # Apply optimizer step
@@ -1049,7 +1166,10 @@ def clm_offload_train_one_batch(
     # 5.3: Final synchronization and return
     # ------------------------------------------------------------------------
     torch.cuda.synchronize()
-    return losses, ordered_cams, sparsity
+    # [MODIFIED vs master] 4th return value added.
+    # Master returned: (losses, ordered_cams, sparsity)
+    # We add async_state (None unless async_allreduce is active).
+    return losses, ordered_cams, sparsity, async_state
 
 
 def clm_offload_eval_one_cam(camera, gaussians, background, scene):

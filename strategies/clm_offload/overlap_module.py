@@ -10,7 +10,6 @@ Overridden hooks
 ----------------
 - ``get_offload_stream``     : Create a dedicated ``offload_stream``.
 - ``pre_compute_offload``    : Pre-compute Category G indices during prefetch.
-- ``before_forward``         : Sync ``offload_stream`` → ``default_stream``.
 - ``pre_gradient_sync``      : Full device synchronise (both streams).
 """
 
@@ -21,7 +20,8 @@ from strategies.clm_offload.strategy_base import BaseStrategy
 class OverlapStrategy(BaseStrategy):
     """Dual-stream overlapped training — separate stream for grad offloading."""
 
-    def __init__(self, gpu_device):
+    def __init__(self, gpu_device=None, **kwargs):
+        super().__init__(**kwargs)
         self._gpu_device = gpu_device
         self._offload_stream = None
 
@@ -48,10 +48,10 @@ class OverlapStrategy(BaseStrategy):
             "indices_ready_event": indices_ready_event,
         }
 
-    # ---------- Stage 4.3: wait for offload before forward ----------
-    def before_forward(self, default_stream):
-        if self._offload_stream is not None:
-            default_stream.wait_stream(self._offload_stream)
+    # ---------- Stage 4.3: no-op ----------
+    # The forward pass doesn't share any GPU memory with offload_stream.
+    # shs_grad is protected by shs_grad_init_event (waited in backward).
+    # Removing wait_stream enables the actual three-way overlap.
 
     # ---------- Stage 5.0: full device sync before all-reduce ----------
     def pre_gradient_sync(self):

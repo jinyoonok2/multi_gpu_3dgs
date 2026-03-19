@@ -20,7 +20,8 @@ from strategies.clm_offload.p2p_comm import P2PCommManager
 class P2PStrategy(BaseStrategy):
     """P2P-enhanced training — cooperative GPU-GPU SH loading via NVLink."""
 
-    def __init__(self, rank, world_size):
+    def __init__(self, rank=0, world_size=1, **kwargs):
+        super().__init__(**kwargs)
         self._p2p_mgr = P2PCommManager(rank, world_size)
 
     # ---------- Stage 1: compute P2P filter partition ----------

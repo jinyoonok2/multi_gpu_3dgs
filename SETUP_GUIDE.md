@@ -78,37 +78,43 @@ data/rubble-colmap/
 
 ## 7. Running Training
 
-### Single GPU
+### Single GPU (master baseline)
 
 ```bash
+# Via SLURM (self-submits):
+bash single_gpu.sh nvidia_a100    # A100 PCIe (cheetah01)
+bash single_gpu.sh a100           # A100 SXM  (cheetah04)
+bash single_gpu.sh a40            # A40       (jaguar nodes)
+
+# Or directly on a GPU node:
 python train.py \
     -s data/rubble-colmap \
     --clm_offload \
-    --eval \
-    -m output/rubble_single_gpu
-```
-
-### Multi-GPU (2 GPUs)
-
-```bash
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0,1
-export NCCL_TIMEOUT=1800
-export NCCL_DEBUG=WARN
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-
-torchrun \
-    --nproc_per_node=2 \
-    --master_addr=localhost \
-    --master_port=29500 \
-    train_multi.py \
-    -s data/rubble-colmap \
-    --clm_offload \
-    --enable_distributed \
     --bsz 8 \
     --eval \
-    -m output/rubble_multi_gpu
+    -m output/rubble_a100_single_clm
 ```
+
+### Multi-GPU (2 GPUs) — Unified Script
+
+The `multi_gpu.sh` script handles all three modes (baseline, P2P, overlap).
+It auto-detects GPUs, picks a dynamic port, and self-submits to SLURM.
+
+```bash
+# Baseline (no optimizations):
+bash multi_gpu.sh nvidia_a100 baseline   # A100 PCIe (cheetah01)
+bash multi_gpu.sh a100 baseline          # A100 SXM  (cheetah04)
+
+# P2P GPU-to-GPU SH sharing (best on NVLink systems):
+bash multi_gpu.sh a100 p2p               # A100 SXM  (cheetah04)
+
+# Overlapped scheduling (dual-stream prefetch/offload):
+bash multi_gpu.sh a100 overlap           # A100 SXM  (cheetah04)
+bash multi_gpu.sh nvidia_a100 overlap    # A100 PCIe (cheetah01)
+```
+
+Output directories are auto-named: `output/rubble_<gpu>_<mode>`
+(e.g., `rubble_a100_multi_clm`, `rubble_a100_multi_p2p`, `rubble_a100_multi_overlap`).
 
 ## 8. SLURM Job Scripts
 
@@ -141,42 +147,21 @@ pip install submodules/fast-tsp
 
 ### Multi-GPU training
 
+The unified `multi_gpu.sh` script self-submits to SLURM — no manual sbatch needed:
+
 ```bash
-#!/bin/bash
-#SBATCH --output=./slurm/slurm%j.out
-#SBATCH --error=./slurm/slurm%j.err
-#SBATCH --nodes=1
-#SBATCH --gres=gpu:2
-#SBATCH --mem=200G
-#SBATCH --cpus-per-task=16
-#SBATCH --partition=gpu
-#SBATCH --time=1-00:00:00
+# Baseline multi-GPU:
+bash multi_gpu.sh a100 baseline
 
-set -e
-source ~/.bashrc
-conda activate clm_gs
-module load cuda/12.8.1
+# P2P (NVLink recommended):
+bash multi_gpu.sh a100 p2p
 
-cd /path/to/CLM-GS
-
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
-export CUDA_VISIBLE_DEVICES=0,1
-export NCCL_TIMEOUT=1800
-export NCCL_DEBUG=WARN
-export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
-
-torchrun \
-    --nproc_per_node=2 \
-    --master_addr=localhost \
-    --master_port=29500 \
-    train_multi.py \
-    -s data/rubble-colmap \
-    --clm_offload \
-    --enable_distributed \
-    --bsz 8 \
-    --eval \
-    -m output/rubble_multi_gpu
+# Overlapped scheduling:
+bash multi_gpu.sh a100 overlap
 ```
+
+The script handles environment setup, dynamic port selection, and GPU detection.
+See `multi_gpu.sh` for the full SLURM configuration.
 
 ## Troubleshooting
 

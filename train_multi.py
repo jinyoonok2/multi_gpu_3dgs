@@ -55,6 +55,7 @@ from strategies.clm_offload import (
 from strategies.clm_offload.engine_multi import (
     clm_offload_train_one_batch,
     clm_offload_eval_one_cam,
+    cpuadam_thread,
 )
 from strategies.no_offload import (
     GaussianModelNoOffload,
@@ -69,6 +70,22 @@ from utils.image_utils import psnr
 from utils.loss_utils import l1_loss
 
 from densification_multi import gsplat_densification
+
+
+def _resolve_async_allreduce(state, parameters_grad_buffer):
+    """Finish a deferred async all-reduce: wait, copy-back, scale, run cpuadam."""
+    import threading
+
+    state["handle"].wait()
+    parameters_grad_buffer[:state["N"], :].copy_(
+        state["cpu_grad_gpu"], non_blocking=False,
+    )
+    del state["cpu_grad_gpu"]
+    parameters_grad_buffer[:state["N"], :].div_(state["total_samples"])
+
+    worker = threading.Thread(target=cpuadam_thread, args=state["cpuadam_args"])
+    worker.start()
+    worker.join()
 
 
 def training(dataset_args, opt_args, pipe_args, args, log_file):
@@ -299,16 +316,24 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # Dedicated stream for CPU↔GPU communication (overlapped with compute)
     comm_stream = torch.cuda.Stream(device=args.gpu, priority=args.comm_stream_priority)
 
-    # --- Create training strategy module (P2P / Overlap / baseline) ---
-    # Each strategy provides hook implementations that modify the unified
-    # engine at specific pipeline stages.  None = baseline (no extra hooks).
-    training_strategy = None
+    # --- Create training strategy module (composable flags) ---
+    # P2P and Overlap override disjoint hooks, so they can be combined
+    # via Python MRO.  The async_allreduce flag is engine-level (not a hook).
+    from strategies.clm_offload.strategy_base import BaseStrategy
+
+    bases = []
     if args.p2p_fetch:
         from strategies.clm_offload.p2p_module import P2PStrategy
-        training_strategy = P2PStrategy(args.rank, args.world_size)
-    elif args.overlap_schedule:
+        bases.append(P2PStrategy)
+    if args.overlap_schedule:
         from strategies.clm_offload.overlap_module import OverlapStrategy
-        training_strategy = OverlapStrategy(args.gpu)
+        bases.append(OverlapStrategy)
+    bases.append(BaseStrategy)
+
+    ComposedStrategy = type("ComposedStrategy", tuple(bases), {})
+    training_strategy = ComposedStrategy(
+        rank=args.rank, world_size=args.world_size, gpu_device=args.gpu,
+    )
 
     # ------------------------------------------------------------------------
     # 1.5: Initialize training loop state
@@ -337,7 +362,10 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     
     # Iteration step size: use per-GPU batch size since each GPU processes independently
     iteration_step = per_gpu_batch_size
-    
+
+    # Async all-reduce state (deferred CPU grad sync from previous iteration)
+    _prev_async_state = None
+
     # ============================================================================
     # STAGE 2: MAIN TRAINING LOOP
     # ============================================================================
@@ -506,9 +534,16 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
 
             N = gaussians._xyz.shape[0]
 
+            # --- Resolve previous iteration's async all-reduce ---
+            if _prev_async_state is not None:
+                _resolve_async_allreduce(
+                    _prev_async_state, gaussians.parameters_grad_buffer,
+                )
+                _prev_async_state = None
+
             # Unified call — the strategy object injects P2P / Overlap
             # behaviour at the appropriate pipeline hook points.
-            losses, ordered_cams, sparsity = clm_offload_train_one_batch(
+            losses, ordered_cams, sparsity, async_state = clm_offload_train_one_batch(
                 gaussians,
                 scene,
                 batched_cameras,
@@ -517,8 +552,12 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
                 pipe_args,
                 comm_stream,
                 perm_generator,
-                strategy=training_strategy,  # None = baseline
+                strategy=training_strategy,
             )
+
+            # Store async state for resolution at next iteration
+            if async_state is not None:
+                _prev_async_state = async_state
 
             batched_screenspace_pkg = {}
             # Reorder cameras to match the optimized processing order
@@ -797,6 +836,13 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
     # ============================================================================
     # STAGE 3: POST-TRAINING CLEANUP AND REPORTING
     # ============================================================================
+
+    # Resolve any remaining async all-reduce from the final iteration
+    if _prev_async_state is not None:
+        _resolve_async_allreduce(
+            _prev_async_state, gaussians.parameters_grad_buffer,
+        )
+        _prev_async_state = None
 
     # Clean up CUDA resources
     del comm_stream

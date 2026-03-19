@@ -27,6 +27,9 @@ from clm_kernels import send_shs2gpu_stream
 class BaseStrategy:
     """Default (baseline) training strategy — all hooks are no-ops."""
 
+    def __init__(self, **kwargs):
+        pass  # Accept and ignore keyword args for MRO chaining
+
     # ------------------------------------------------------------------
     # Stage 1: After filter calculation + camera ordering
     # ------------------------------------------------------------------

@@ -1,86 +1,81 @@
-# Multi-GPU CLM Optimization — All Changes
+# p2p_overlap Branch — Changes from Master
 
-Consolidated record of every file added or modified across both methods.
-The baseline is `engine_multi.py` (original multi-GPU CLM engine, **never modified**).
-
----
-
-## At a Glance
-
-| | Method 1 — P2P SH Sharing | Method 2 — Overlapped Scheduling |
-|---|---|---|
-| **Flag** | `--p2p_fetch` | `--overlap_schedule` |
-| **Core idea** | GPU-to-GPU SH sharing via NVLink/NCCL to avoid duplicate PCIe loads | Dual CUDA streams to overlap prefetch, compute, and grad offload |
-| **New engine** | `engine_multi_p2p.py` | `engine_multi_overlap.py` |
-| **Launch script** | `multi_gpu_p2p.sh` | `multi_gpu_overlap.sh` |
-| **Best on** | NVLink systems (A100 SXM, H100 NVL) | Any multi-GPU (PCIe or NVLink) |
+All changes relative to the `master` branch (`3f8781e`).
 
 ---
 
-## New Files
+## Architecture
 
-| File | Method | Purpose |
-|------|--------|---------|
-| `strategies/clm_offload/p2p_comm.py` | 1 | `P2PCommManager`: filter partition, cooperative SH loading, gradient sync |
-| `strategies/clm_offload/engine_multi_p2p.py` | 1 | P2P-modified training engine |
-| `multi_gpu_p2p.sh` | 1 | SLURM launch script (`--p2p_fetch`) |
-| `strategies/clm_offload/engine_multi_overlap.py` | 2 | Dual-stream training engine |
-| `multi_gpu_overlap.sh` | 2 | SLURM launch script (`--overlap_schedule`) |
+A **modular strategy pattern** replaces per-method engine copies with a single
+unified engine and pluggable strategy modules. The engine calls 7 hook points;
+each strategy overrides only the hooks it needs.
+
+| Mode | Flag | Strategy class | Hooks overridden |
+|------|------|----------------|------------------|
+| Baseline | *(none)* | `BaseStrategy` (no-ops) | 0 |
+| P2P SH Sharing | `--p2p_fetch` | `P2PStrategy` | 3 (`post_filters`, `load_first_shs`, `sync_gradients`) |
+| Overlapped Scheduling | `--overlap_schedule` | `OverlapStrategy` | 3 (`get_offload_stream`, `pre_compute_offload`, `pre_gradient_sync`) |
+
+**Launch**: `bash multi_gpu.sh <partition> [baseline|p2p|overlap]`
+
+---
+
+## New Files (6)
+
+| File | Lines | Purpose |
+|------|-------|---------|
+| `strategies/clm_offload/strategy_base.py` | 123 | `BaseStrategy` — 7 pipeline hooks with no-op defaults |
+| `strategies/clm_offload/p2p_module.py` | 80 | `P2PStrategy` — cooperative GPU-GPU SH loading via NVLink/NCCL |
+| `strategies/clm_offload/overlap_module.py` | 55 | `OverlapStrategy` — dedicated CUDA stream for gradient offload |
+| `strategies/clm_offload/p2p_comm.py` | 250 | `P2PCommManager` — filter partition, SH sharing, gradient sync |
 | `CHANGES.md` | — | This file |
+| `SETUP_GUIDE.md` | 185 | Environment setup and run instructions |
+| `SUMMARY_METHODS.md` | 383 | Detailed method descriptions |
 
-## Modified Files
+## Modified Files (4)
 
-| File | Method | Change |
-|------|--------|--------|
-| `arguments/__init__.py` | 1 | Added `self.p2p_fetch = False` (line 172) |
-| `arguments/__init__.py` | 2 | Added `self.overlap_schedule = False` (line 173) |
-| `train_multi.py` | 1+2 | Imports both engines; dispatches via `args.p2p_fetch` / `args.overlap_schedule` |
-
-## Unchanged (read-only reference)
-
-- `strategies/clm_offload/engine_multi.py` — baseline engine (single `comm_stream`)
+| File | Change |
+|------|--------|
+| `strategies/clm_offload/engine_multi.py` | +151/−114 — added `strategy` parameter and 7 hook call sites |
+| `train_multi.py` | +33 — creates strategy object, passes to unified engine |
+| `arguments/__init__.py` | +2 — added `p2p_fetch` and `overlap_schedule` flags |
+| `multi_gpu.sh` | +86/−15 — unified script with `MODE` argument (baseline/p2p/overlap) |
 
 ---
 
-## Method 1 — P2P GPU-to-GPU SH Sharing
+## Hook Points in engine_multi.py
 
-### Problem
-Both GPUs independently load overlapping SH coefficients from CPU via PCIe
-(~25 GB/s each), doubling PCIe traffic for shared Gaussians.
+| # | Hook | Stage | Purpose |
+|---|------|-------|---------|
+| 1 | `post_filters` | 1 | After filter + ordering — P2P computes overlap partition |
+| 2 | `get_offload_stream` | 3 | Return CUDA stream for grad offload — Overlap creates dedicated stream |
+| 3 | `load_first_shs` | 4.1 | Load SH for micro_idx=0 — P2P does cooperative GPU-GPU loading |
+| 4 | `pre_compute_offload` | 4.2 | After H/D indices in prefetch — Overlap pre-computes Category G indices |
+| 5 | `before_forward` | 4.3 | Before forward pass — available hook (currently no-op for all strategies) |
+| 6 | `pre_gradient_sync` | 5.0 | Before all-reduce — Overlap does full device synchronize |
+| 7 | `sync_gradients` | 5.0 | Perform gradient sync — P2P uses P2PCommManager |
 
-### Solution
-Exchange visibility filters, then GPU 0 loads shared SH once and broadcasts
+---
+
+## P2P SH Sharing (`--p2p_fetch`)
+
+**Problem**: Both GPUs independently load overlapping SH coefficients from CPU
+via PCIe (~25 GB/s each), doubling PCIe traffic for shared Gaussians.
+
+**Solution**: Exchange visibility filters across GPUs, classify Gaussians as
+overlap / local-only / peer-only. GPU 0 loads shared SHs once and broadcasts
 to GPU 1 via NVLink (600–900 GB/s).
 
-### Pipeline changes
-
-| Stage | What changed |
-|-------|-------------|
-| **1 — Filters** | Exchange filters across GPUs via `all_reduce`; classify Gaussians as *overlap / local_only / peer_only* |
-| **4.1 — First SH load** | `P2PCommManager.share_shs_p2p()`: GPU 0 loads overlap from CPU, broadcasts via NCCL; each GPU loads local-only independently |
-| **4.2+ — Retention** | Unchanged (already GPU-local optimization) |
-| **5.0 — Grad sync** | `P2PCommManager.sync_gradients_p2p()` (same semantics, encapsulated) |
-
-### Expected benefit
-- **NVLink (A100, H100)**: Significant PCIe savings — overlap Gaussians loaded 1× instead of 2×.
-- **PCIe-only (A40)**: Minimal benefit — GPU↔GPU P2P shares the same bus.
-
-### How to run
-```bash
-bash multi_gpu_p2p.sh a100
-```
+**Best on**: NVLink systems (A100 SXM, H100 NVL). Minimal benefit on PCIe-only.
 
 ---
 
-## Method 2 — Dual-Stream Overlapped Scheduling
+## Overlapped Scheduling (`--overlap_schedule`)
 
-### Problem
-A single `comm_stream` handles both SH prefetch (CPU→GPU) and gradient
-offload (GPU→CPU), serializing them.
+**Problem**: A single `comm_stream` handles both SH prefetch (CPU→GPU) and
+gradient offload (GPU→CPU), serializing them.
 
-### Solution
-Split into two CUDA streams so prefetch, compute, and offload all run
-concurrently:
+**Solution**: Dedicated `offload_stream` enables three-way overlap:
 
 ```
 comm_stream:     [prefetch SH(i+1)]
@@ -88,21 +83,4 @@ default_stream:  [fwd(i)]  [bwd(i)]
 offload_stream:              [offload grad(i-1)]
 ```
 
-### Pipeline changes
-
-| Stage | What changed |
-|-------|-------------|
-| **3 — Init** | Create dedicated `offload_stream` |
-| **4.2 — Prefetch** | Pre-compute Category G indices for later offload; record `indices_ready_event` |
-| **4.6 — Grad offload** | Runs on `offload_stream` (waits `gpu2cpu_event` + `indices_ready_event`) instead of `comm_stream` |
-| **5 — Post-training** | `torch.cuda.synchronize()` drains both streams before all-reduce |
-
-### Expected benefit
-- Reduced iteration time when prefetch transfer is large relative to backward.
-- Greatest on PCIe-bottlenecked configs (many Gaussians, constrained bandwidth).
-- Still helps on NVLink, though absolute gain may be smaller.
-
-### How to run
-```bash
-bash multi_gpu_overlap.sh a100
-```
+**Best on**: Any multi-GPU setup; greatest benefit on PCIe-bottlenecked configs.

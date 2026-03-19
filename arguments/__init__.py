@@ -171,6 +171,7 @@ class AuxiliaryParams(ParamGroup):
         self.dist_url = "env://"  # Distributed init URL
         self.p2p_fetch = False  # Enable GPU-to-GPU P2P SH sharing via NVLink/NCCL
         self.overlap_schedule = False  # Enable dual-stream overlapped prefetch/offload
+        self.async_allreduce = False  # Enable async all-reduce (overlap grad sync with next iter)
 
         # ====================================================================
         # DATASET-SPECIFIC FLAGS
