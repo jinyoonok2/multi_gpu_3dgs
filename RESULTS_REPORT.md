@@ -6,7 +6,7 @@
 
 ## 1. Overview
 
-This report presents experimental results from implementing and evaluating three multi-GPU communication optimization strategies for **CLM-GS** (Compact Language Model for 3D Gaussian Splatting), a memory-efficient 3DGS training framework that offloads spherical harmonic (SH) coefficients to CPU memory and uses CPU Adam for parameter updates.
+This report presents experimental results from implementing and evaluating three multi-GPU communication optimization strategies for **CLM-GS** (CPU-offloading for Large-scale Mapping Gaussian Splatting), a memory-efficient 3DGS training framework that offloads spherical harmonic (SH) coefficients to CPU memory and uses CPU Adam for parameter updates.
 
 We tested on two GPU architectures with fundamentally different interconnects:
 - **NVIDIA A100-SXM 80GB** — connected via **NVLink** (~600 GB/s bidirectional)
@@ -230,5 +230,5 @@ The remaining bottleneck on NVLink systems is the **single-threaded CPU Adam opt
 ---
 
 **Cluster:** UVA CS Department — jaguar02 (8× A16, 32 CPUs), cheetah04 (A100 SXM nodes)
-**Framework:** CLM-GS (Compact Language Model Gaussian Splatting) with custom multi-GPU extensions
+**Framework:** CLM-GS (CPU-offloading for Large-scale Mapping Gaussian Splatting) with custom multi-GPU extensions
 **Software:** PyTorch 2.x, NCCL 2.21.5, CUDA 12.4
