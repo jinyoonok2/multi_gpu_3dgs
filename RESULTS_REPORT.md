@@ -87,7 +87,7 @@ Uses a dedicated CUDA stream (`offload_stream`) to overlap SH CPU↔GPU memory t
 | Baseline | 2× A100 SXM | NVLink | 24.94 | 0.0421 |
 | P2P | 2× A100 SXM | NVLink | **25.00** | 0.0419 |
 | Async All-Reduce | 2× A100 SXM | NVLink | 24.93 | 0.0421 |
-| Baseline | 2× A16 | PCIe | 24.94 | 0.0422 |
+| Baseline | 2× A16 | PCIe | 24.97 | 0.0419 |
 | Async All-Reduce | 2× A16 | PCIe | 24.91 | 0.0423 |
 | Overlap | 2× A16 | PCIe | 24.89 | 0.0425 |
 
@@ -101,8 +101,8 @@ Uses a dedicated CUDA stream (`offload_stream`) to overlap SH CPU↔GPU memory t
 | Baseline | 2× A100 SXM | NVLink | 2h 28m | 0.59 | 1.00× |
 | P2P | 2× A100 SXM | NVLink | 2h 29m | 0.60 | 0.98× |
 | Async All-Reduce | 2× A100 SXM | NVLink | 2h 26m | 0.59 | 1.00× |
-| Baseline | 2× A16 | PCIe | 6h 09m | 1.48 | 1.00× |
-| Async All-Reduce | 2× A16 | PCIe | **2h 16m** | **0.55** | **2.69×** |
+| Baseline | 2× A16 | PCIe | 6h 13m | 1.49 | 1.00× |
+| Async All-Reduce | 2× A16 | PCIe | **2h 16m** | **0.55** | **2.71×** |
 | Overlap | 2× A16 | PCIe | 6h 09m | 1.48 | 1.00× |
 
 *Speedup is relative to the same-hardware baseline (A100 baseline for A100 rows, A16 baseline for A16 rows).
@@ -113,13 +113,13 @@ Uses a dedicated CUDA stream (`offload_stream`) to overlap SH CPU↔GPU memory t
 
 ### 5.1 Why Async All-Reduce Achieves 2.69× Speedup on A16 PCIe
 
-The A16 baseline iteration takes 1.48s. Of that, only ~0.55s is useful compute (GPU rendering, backward pass, CPU Adam). The remaining ~0.93s — **63% of total iteration time** — is spent idle, waiting for the all-reduce gradient synchronization to complete over the PCIe bus.
+The A16 baseline iteration takes 1.49s. Of that, only ~0.55s is useful compute (GPU rendering, backward pass, CPU Adam). The remaining ~0.94s — **63% of total iteration time** — is spent idle, waiting for the all-reduce gradient synchronization to complete over the PCIe bus.
 
 Async all-reduce eliminates this idle time by overlapping the gradient sync with the next iteration's forward pass. By the time the forward pass of iteration N+1 completes, the all-reduce from iteration N has finished in the background.
 
 ```
 Baseline (blocking):
-  [Compute 0.55s][====== All-Reduce 0.93s ======]  → 1.48s total
+  [Compute 0.55s][====== All-Reduce 0.94s ======]  → 1.49s total
                   ↑ GPUs idle here
 
 Async (non-blocking):
@@ -135,7 +135,7 @@ On A100 with NVLink (~600 GB/s), the all-reduce completes in approximately 25ms 
 | Component | A100 NVLink | A16 PCIe |
 |---|---|---|
 | GPU Compute (render + backward) | ~450ms (76%) | ~450ms (30%) |
-| All-Reduce Gradient Sync | ~25ms (4%) | **~930ms (63%)** |
+| All-Reduce Gradient Sync | ~25ms (4%) | **~940ms (63%)** |
 | CPU Adam Optimizer | ~80ms (14%) | ~50ms (3%) |
 | SH Transfer (CPU↔GPU) | ~35ms (6%) | ~50ms (3%) |
 
@@ -143,7 +143,7 @@ On A100, **communication is not the bottleneck** — it constitutes only ~4% of 
 
 ### 5.3 Why Overlap Shows No Improvement Even on A16
 
-Overlap targets SH CPU↔GPU transfers (~50ms per iteration, ~3% of total). Even with perfect overlap, the savings are imperceptible against the 930ms all-reduce cost. Overlap optimizes the wrong bottleneck.
+Overlap targets SH CPU↔GPU transfers (~50ms per iteration, ~3% of total). Even with perfect overlap, the savings are imperceptible against the 940ms all-reduce cost. Overlap optimizes the wrong bottleneck.
 
 ### 5.4 Why P2P Shows No Improvement on A100 NVLink
 
@@ -196,7 +196,7 @@ Testing P2P on A16 PCIe would produce results identical (or slightly worse) than
 
 ## 7. Conclusions
 
-1. **Async all-reduce is highly effective on PCIe-connected GPUs** (2.69× speedup on A16), where gradient synchronization dominates iteration time (63%). This is a practical win for the common case of multi-GPU training without NVLink.
+1. **Async all-reduce is highly effective on PCIe-connected GPUs** (2.71× speedup on A16), where gradient synchronization dominates iteration time (63%). This is a practical win for the common case of multi-GPU training without NVLink.
 
 2. **No communication optimization helps on NVLink-connected GPUs** (A100 SXM). NVLink reduces inter-GPU communication to ~4% of iteration time, making it a non-bottleneck. The dominant cost shifts to the CPU Adam optimizer, which none of our methods address.
 
@@ -223,12 +223,9 @@ The remaining bottleneck on NVLink systems is the **single-threaded CPU Adam opt
 | 5622780 | Baseline 2-GPU | 2× A100 SXM-80GB | Complete | 24.94 | 2h 28m |
 | 5621229 | P2P 2-GPU | 2× A100 SXM-80GB | Complete | 25.00 | 2h 29m |
 | 5623273 | Async 2-GPU | 2× A100 SXM-80GB | Complete | 24.93 | 2h 26m |
-| 5638692 | Baseline 2-GPU | 2× A16 | Complete | 24.94 | 6h 09m |
+| 5644690 | Baseline 2-GPU | 2× A16 | Complete | 24.97 | 6h 13m |
 | 5634761 | Async 2-GPU | 2× A16 | Complete | 24.91 | 2h 16m |
 | 5643462 | Overlap 2-GPU | 2× A16 | Complete | 24.89 | 6h 09m |
-| 5644690 | Baseline 2-GPU (rerun) | 2× A16 | Queued | — | — |
-
-*Note: A16 baseline (5638692) was run before final code changes. A rerun (5644690) is queued for validation. We expect results to be consistent since the overlap and async changes are isolated code paths that do not affect baseline execution.*
 
 ---
 
