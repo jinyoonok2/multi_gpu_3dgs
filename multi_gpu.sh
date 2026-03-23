@@ -28,14 +28,15 @@ set -e
 # ---- Parse arguments ----
 GPU_CHOICE="${1:-a100}"
 MODE="${2:-baseline}"
+NUM_GPU="${3:-2}"
 
 case "${GPU_CHOICE}" in
-    a16)         GRES="gpu:nvidia_a16:2" ;;
-    a40)         GRES="gpu:a40:2" ;;
-    nvidia_a40)  GRES="gpu:nvidia_a40:2" ;;
-    a100)        GRES="gpu:a100:2" ;;
-    nvidia_a100) GRES="gpu:nvidia_a100-pcie-40gb:2" ;;
-    *)  echo "Usage: bash multi_gpu.sh {a16|a40|nvidia_a40|a100|nvidia_a100} [baseline|p2p|overlap]"
+    a16)         GRES="gpu:nvidia_a16:${NUM_GPU}" ;;
+    a40)         GRES="gpu:a40:${NUM_GPU}" ;;
+    nvidia_a40)  GRES="gpu:nvidia_a40:${NUM_GPU}" ;;
+    a100)        GRES="gpu:a100:${NUM_GPU}" ;;
+    nvidia_a100) GRES="gpu:nvidia_a100-pcie-40gb:${NUM_GPU}" ;;
+    *)  echo "Usage: bash multi_gpu.sh {a16|a40|nvidia_a40|a100|nvidia_a100} [baseline|p2p|overlap] [num_gpus]"
         exit 1 ;;
 esac
 
@@ -56,9 +57,9 @@ fi
 
 # Self-submit to SLURM if not already running inside a job
 if [[ -z "$SLURM_JOB_ID" ]]; then
-    echo "Submitting: sbatch --gres=${GRES} --mem=${SLURM_MEM} $0 ${GPU_CHOICE} ${MODE}"
-    sbatch --gres="${GRES}" --mem="${SLURM_MEM}" --export="ALL,GPU_CHOICE=${GPU_CHOICE},MODE=${MODE}" \
-           "$0" "${GPU_CHOICE}" "${MODE}"
+    echo "Submitting: sbatch --gres=${GRES} --mem=${SLURM_MEM} $0 ${GPU_CHOICE} ${MODE} ${NUM_GPU}"
+    sbatch --gres="${GRES}" --mem="${SLURM_MEM}" --export="ALL,GPU_CHOICE=${GPU_CHOICE},MODE=${MODE},NUM_GPU=${NUM_GPU}" \
+           "$0" "${GPU_CHOICE}" "${MODE}" "${NUM_GPU}"
     exit 0
 fi
 
@@ -76,6 +77,9 @@ export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 NUM_GPUS=$(nvidia-smi -L | wc -l)
 GPU_IDS=$(seq -s, 0 $((NUM_GPUS - 1)))
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
+
+# Scale batch size to keep per-GPU batch size = 4
+BSZ=$(( NUM_GPUS * 4 ))
 
 export NCCL_TIMEOUT=1800
 export NCCL_DEBUG=WARN
@@ -120,12 +124,19 @@ case "${MODE}" in
 esac
 
 # ---- Print run info ----
+# Include GPU count in output dir when not the default 2
+if [[ "${NUM_GPU}" != "2" ]]; then
+    OUTPUT_DIR="output/rubble_${GPU_TAG}_x${NUM_GPU}_${OUTPUT_SUFFIX}"
+else
+    OUTPUT_DIR="output/rubble_${GPU_TAG}_${OUTPUT_SUFFIX}"
+fi
+
 echo "================================================="
 echo "  Multi-GPU CLM Training"
 echo "  Mode:   ${MODE}"
 echo "  GPU:    ${GPU_CHOICE} x${NUM_GPUS}"
 echo "  Port:   ${MASTER_PORT}"
-echo "  Output: output/rubble_${GPU_TAG}_${OUTPUT_SUFFIX}"
+echo "  Output: ${OUTPUT_DIR}"
 echo "================================================="
 nvidia-smi --query-gpu=name,memory.total --format=csv,noheader
 echo "================================================="
@@ -140,6 +151,6 @@ torchrun \
     --clm_offload \
     --enable_distributed \
     ${EXTRA_FLAGS} \
-    --bsz 8 \
+    --bsz ${BSZ} \
     --eval \
-    -m "output/rubble_${GPU_TAG}_${OUTPUT_SUFFIX}"
+    -m "${OUTPUT_DIR}"

@@ -515,12 +515,8 @@ def clm_offload_train_one_batch(
     num_micro_batches = len(batched_cameras)
     N = gaussians._xyz.shape[0]
     losses = []
+
     shs_retents = [None for i in range(num_micro_batches)]  # Retained SH coefficients
-    # [ADDED vs master] Keep-alive list: holds references to tensors being read
-    # by offload_stream, preventing Python GC from freeing GPU memory while
-    # async kernels are still using it.  Harmless in baseline (list stays empty
-    # or holds refs to tensors that would be alive anyway).
-    _offload_keepalive = []
 
     # Kernel launch parameters
     grid_size, block_size = args.grid_size_H, 256
@@ -792,6 +788,7 @@ def clm_offload_train_one_batch(
         loss = torch_compiled_loss(
             rendered_image, batched_cameras[micro_idx].original_image
         )
+
         torch.cuda.nvtx.range_pop()
 
         # ------------------------------------------------------------------------
@@ -811,7 +808,9 @@ def clm_offload_train_one_batch(
             v_coeffs=shs_grad,
             v_colors=batched_colors_detached.grad,
         )
+
         dirs.backward(v_dirs)
+
         torch.cuda.nvtx.range_pop()
 
         # ------------------------------------------------------------------------
@@ -861,7 +860,7 @@ def clm_offload_train_one_batch(
 
         # ------------------------------------------------------------------------
         # 4.6: Offload SH gradients back to CPU (GPU → CPU)
-        # [MODIFIED vs master] Two changes:
+        # [MODIFIED vs master] Changes from master:
         #   1. Uses offload_stream instead of comm_stream.
         #      Baseline/P2P: offload_stream == comm_stream → same as master.
         #      Overlap: offload_stream is a separate CUDA stream → three-way
@@ -870,15 +869,12 @@ def clm_offload_train_one_batch(
         #   2. Category G index computation is conditional:
         #      If precomp_offload_data has pre-computed indices (Overlap hook
         #      4/7 in Stage 4.2), use those; otherwise compute inline (master).
-        #   3. Added _offload_keepalive to prevent premature tensor dealloc.
+        #   3. Uses record_stream() to prevent premature tensor deallocation.
         #   4. Added next_cpu2gpu_event.wait(offload_stream) guard.
         # ------------------------------------------------------------------------
         if micro_idx < num_micro_batches - 1:
             # Non-final micro-batch: use retention-based selective gradient offloading
             with torch.cuda.stream(offload_stream), torch.no_grad():
-                # [ADDED vs master] Release previous keep-alive refs.
-                _offload_keepalive.clear()
-
                 # Reuse indices from prefetch step (Category D)
                 rtnt_indices_from_grad = (
                     param_indices_from_rtnt  # Category D: retained indices
@@ -928,14 +924,21 @@ def clm_offload_train_one_batch(
                     block_size_D,
                 )
 
-                # [ADDED vs master] Keep tensors alive until offload_stream
-                # finishes reading them.  Without this, Python may GC the refs
-                # before the async GPU kernel runs, letting the allocator
-                # recycle the memory → illegal memory access.
-                _offload_keepalive = [
-                    shs_grad, host_indices_from_grad, rtnt_indices_from_grad,
-                    grad_indices_to_host, grad_indices_to_rtnt,
-                ]
+                # [FIX vs previous] Use record_stream() instead of
+                # _offload_keepalive list.  record_stream tells the CUDA
+                # caching allocator that offload_stream is still reading
+                # these tensors, so their memory won't be recycled until
+                # offload_stream advances past this point.  The old
+                # _offload_keepalive.clear() at the START of the next
+                # iteration's Stage 4.6 was a Python/CPU operation that
+                # freed memory immediately — before offload_stream's GPU
+                # kernels finished reading it — causing illegal memory
+                # access when the allocator handed that memory to
+                # default_stream.
+                for _t in [shs_grad, host_indices_from_grad,
+                           rtnt_indices_from_grad,
+                           grad_indices_to_host, grad_indices_to_rtnt]:
+                    _t.record_stream(offload_stream)
 
                 shs_grad = shs_grad_next
                 # [MODIFIED vs master] Record on offload_stream, not comm_stream.
@@ -995,6 +998,13 @@ def clm_offload_train_one_batch(
     # STAGE 5: POST-TRAINING OPTIMIZATION & CLEANUP
     # ============================================================================
 
+    # [NaN GUARD] Replace any NaN in GPU gradients with zero.
+    # Non-deterministic stream races can rarely inject NaN into xyz.grad;
+    # zeroing prevents the cascade (NaN xyz → NaN densification → collapse).
+    for _p in gaussians.all_parameters()[:4]:
+        if _p.grad is not None:
+            _p.grad.nan_to_num_(nan=0.0)
+
     # Sanity checks for overlapped CPU Adam configuration
     assert microbatch_idx == bsz, "microbatch_idx should be equal to bsz."
     assert args.lr_scale_mode == "sqrt", "Overlap CPUAdam only supports sqrt lr scaling"
@@ -1027,6 +1037,7 @@ def clm_offload_train_one_batch(
         # Baseline / Overlap return False → fall through to the all-reduce.
         if not strategy.sync_gradients(gaussians, parameters_grad_buffer, N, args):
         # ── END HOOK 7 (wraps the all-reduce block below) ────────────────
+
             torch.cuda.nvtx.range_push("all_reduce all gradients")
 
             # Sync GPU parameters gradients (xyz, opacity, scaling, rotation)
@@ -1078,11 +1089,18 @@ def clm_offload_train_one_batch(
 
             torch.cuda.nvtx.range_pop()
 
-        # [MODIFIED vs master] Start CPU Adam thread conditionally.
-        # Master: always started cpuadam_worker here.
-        # async mode: defers cpuadam to the start of the NEXT iteration
-        # (resolved in train_multi.py's _resolve_async_allreduce).
+        # [MODIFIED vs master] Scale + start CPU Adam thread conditionally.
+        # Master: started cpuadam_worker first, then div_ (data race because
+        # pre_gradient_sync drains all streams, so all signals are pre-set and
+        # CPU Adam would start processing grad_buffer immediately).
+        # Fix: divide BEFORE starting the thread to eliminate the race.
         if async_state is None:
+            # Scale CPU gradients BEFORE starting CPU Adam thread
+            if args.enable_distributed and args.world_size > 1:
+                parameters_grad_buffer[:N, :].div_(
+                    args.bsz * args.world_size
+                )
+
             cpuadam_worker = threading.Thread(
                 target=cpuadam_thread,
                 args=(
@@ -1107,12 +1125,6 @@ def clm_offload_train_one_batch(
     for param in gaussians.all_parameters()[:4]:  # First 4 parameters are cached on GPU
         if param.grad is not None:
             param.grad /= total_samples
-    
-    # [MODIFIED vs master] Scale CPU gradients.
-    # Master: always scaled here.  We skip when async_allreduce is active
-    # because the copy-back + scaling is deferred to the next iteration.
-    if async_state is None and args.enable_distributed and args.world_size > 1:
-        parameters_grad_buffer[:N, :].div_(total_samples)
 
     # Apply optimizer step
     if not args.stop_update_param:
@@ -1122,6 +1134,7 @@ def clm_offload_train_one_batch(
         else:
             # Dense Adam: update all parameters
             gaussians.optimizer.gpu_adam.step()
+
     gaussians.optimizer.gpu_adam.zero_grad(set_to_none=True)
 
     # ------------------------------------------------------------------------

@@ -23,11 +23,13 @@ class OverlapStrategy(BaseStrategy):
     def __init__(self, gpu_device=None, **kwargs):
         super().__init__(**kwargs)
         self._gpu_device = gpu_device
-        self._offload_stream = None
+        # Create the offload stream ONCE — reusing across iterations prevents
+        # record_stream() annotations from becoming dangling references when
+        # the CUDA caching allocator reclaims memory after densification.
+        self._offload_stream = torch.cuda.Stream(device=gpu_device)
 
     # ---------- Stage 3: dedicated offload stream ----------
     def get_offload_stream(self, comm_stream, args):
-        self._offload_stream = torch.cuda.Stream(device=self._gpu_device)
         return self._offload_stream
 
     # ---------- Stage 4.2: pre-compute Category G indices ----------
@@ -48,10 +50,13 @@ class OverlapStrategy(BaseStrategy):
             "indices_ready_event": indices_ready_event,
         }
 
-    # ---------- Stage 4.3: no-op ----------
-    # The forward pass doesn't share any GPU memory with offload_stream.
-    # shs_grad is protected by shs_grad_init_event (waited in backward).
-    # Removing wait_stream enables the actual three-way overlap.
+    # ---------- Stage 4.3: sync offload before forward ----------
+    # Diagnostic: ensure previous micro-batch's offload completes before
+    # the next forward pass.  If this fixes NaN, there is a latent
+    # memory-ordering issue between offload_stream and default_stream.
+    def before_forward(self, default_stream):
+        if self._offload_stream is not None:
+            self._offload_stream.synchronize()
 
     # ---------- Stage 5.0: full device sync before all-reduce ----------
     def pre_gradient_sync(self):
