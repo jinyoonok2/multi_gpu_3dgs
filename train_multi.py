@@ -115,46 +115,20 @@ def training(dataset_args, opt_args, pipe_args, args, log_file):
         args.local_rank = int(os.environ.get('LOCAL_RANK', 0))
         args.world_size = int(os.environ.get('WORLD_SIZE', 1))
         
-        # Auto-scale parameters for multi-GPU training to maintain fair budget
-        # When using N GPUs, each sees args.bsz/N samples, but total batch = args.bsz
-        # To keep total images seen constant, we scale iterations by 1/world_size
-        if args.world_size > 1:
-            scale_factor = 1.0 / args.world_size
-            
-            # Scale all iteration-related parameters
-            opt_args.iterations = int(opt_args.iterations * scale_factor)
-            opt_args.densify_from_iter = int(opt_args.densify_from_iter * scale_factor)
-            opt_args.densify_until_iter = int(opt_args.densify_until_iter * scale_factor)
-            opt_args.densification_interval = max(1, int(opt_args.densification_interval * scale_factor))
-            opt_args.position_lr_max_steps = int(opt_args.position_lr_max_steps * scale_factor)
-            opt_args.opacity_reset_interval = int(opt_args.opacity_reset_interval * scale_factor)
-
-            # Keep global args in sync with scaled optimization schedule.
-            # Densification helpers read from utils.get_args(), not opt_args.
-            args.iterations = opt_args.iterations
-            args.densify_from_iter = opt_args.densify_from_iter
-            args.densify_until_iter = opt_args.densify_until_iter
-            args.densification_interval = opt_args.densification_interval
-            args.opacity_reset_interval = opt_args.opacity_reset_interval
-            args.position_lr_max_steps = opt_args.position_lr_max_steps
-
-            args.test_iterations = [int(x * scale_factor) for x in args.test_iterations]
-            args.save_iterations = [int(x * scale_factor) for x in args.save_iterations]
-            args.checkpoint_iterations = [int(x * scale_factor) for x in args.checkpoint_iterations]
-            
-            if args.rank == 0:
-                print(f"\n{'='*60}")
-                print(f"Multi-GPU Auto-Scaling Enabled")
-                print(f"{'='*60}")
-                print(f"World size: {args.world_size} GPUs")
-                print(f"Scale factor: {scale_factor:.2f}x")
-                print(f"Total batch size: {args.bsz} ({args.bsz // args.world_size} per GPU)")
-                print(f"Iterations: {opt_args.iterations} (scaled from 30000)")
-                print(f"Densify until: {opt_args.densify_until_iter} (scaled from 15000)")
-                print(f"Test iterations: {args.test_iterations}")
-                print(f"Densification mode: {getattr(args, 'densification_mode', 1)}")
-                print(f"Total images seen: {opt_args.iterations * args.bsz}")
-                print(f"{'='*60}\n")
+        # Multi-GPU training: iterations are NOT scaled because all-reduce already
+        # makes each step equivalent to single-GPU BSZ=args.bsz. Both single-GPU and
+        # multi-GPU run the same number of iterations for a fair comparison.
+        if args.world_size > 1 and args.rank == 0:
+            print(f"\n{'='*60}")
+            print(f"Multi-GPU Training")
+            print(f"{'='*60}")
+            print(f"World size: {args.world_size} GPUs")
+            print(f"Total batch size: {args.bsz} ({args.bsz // args.world_size} per GPU, all-reduced)")
+            print(f"Iterations: {opt_args.iterations} (same as single-GPU)")
+            print(f"Densify until: {opt_args.densify_until_iter}")
+            print(f"Test iterations: {args.test_iterations}")
+            print(f"Total images seen: {opt_args.iterations * args.bsz}")
+            print(f"{'='*60}\n")
         
         # Initialize process group with explicit device_id
         # This fixes the warning about unknown devices during barrier operations
