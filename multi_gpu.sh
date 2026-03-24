@@ -78,8 +78,10 @@ NUM_GPUS=$(nvidia-smi -L | wc -l)
 GPU_IDS=$(seq -s, 0 $((NUM_GPUS - 1)))
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 
-# Scale batch size to keep per-GPU batch size = 4
-BSZ=$(( NUM_GPUS * 4 ))
+# Weak scaling: each GPU uses same BSZ as single-GPU (BSZ=8)
+# Total global batch = NUM_GPUS * 8; iterations are scaled down in train_multi.py
+# so total images seen = single-GPU (e.g. 2 GPUs: BSZ=16, 15k iters = 240k images)
+BSZ=$(( NUM_GPUS * 8 ))
 
 export NCCL_TIMEOUT=1800
 export NCCL_DEBUG=WARN
