@@ -44,15 +44,12 @@ conda activate clm_gs
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 export CUDA_VISIBLE_DEVICES=0
 
-# Ensure SLURM memory limit is visible to Python for prealloc_capacity calculation.
-# On some clusters SLURM_MEM_PER_NODE is not set when --mem (not --mem-per-cpu) is used;
-# fall back to computing it from the MEM variable used in the sbatch call.
-if [[ -z "${SLURM_MEM_PER_NODE}" ]]; then
-    case "${MEM}" in
-        *G) export SLURM_MEM_PER_NODE=$(( ${MEM%G} * 1024 )) ;;
-        *M) export SLURM_MEM_PER_NODE=${MEM%M} ;;
-    esac
-fi
+# Compute safe prealloc_capacity from the requested SLURM memory budget.
+# Formula: (MEM_bytes * 0.7) / (48 floats * 4 bytes * 4 tensors) rounded to 16.
+# Pass it explicitly so the auto-calculation never falls back to psutil-reported
+# node RAM, which would over-allocate and OOM on machines with large system RAM.
+MEM_GB=${MEM%G}
+PREALLOC=$(python3 -c "print(int(${MEM_GB}*1024**3*0.7/(48*4*4))//16*16)")
 
 OUTPUT_DIR="output/rubble_${GPU_TAG}_single"
 
@@ -67,6 +64,7 @@ echo "================================================="
 python train.py \
     -s data/rubble-colmap \
     --clm_offload \
+    --prealloc_capacity ${PREALLOC} \
     --bsz 8 \
     --eval \
     -m "${OUTPUT_DIR}"
