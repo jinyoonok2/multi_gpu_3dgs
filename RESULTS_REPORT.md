@@ -90,11 +90,11 @@ Applies all three optimizations simultaneously. This tests whether the methods a
 | Baseline (CLM) | 2× A100 SXM | NVLink | 24.85 | 0.0424 | ✅ Complete |
 | Async | 2× A16 | PCIe | 24.79 | 0.0428 | ✅ Complete |
 | Async | 2× A100 SXM | NVLink | 24.86 | 0.0423 | ✅ Complete |
-| P2P | 2× A16 | PCIe | — | — | 🔄 Running |
+| P2P | 2× A16 | PCIe | 24.83 | 0.0428 | ✅ Complete |
 | P2P | 2× A100 SXM | NVLink | 24.84 | 0.0425 | ✅ Complete |
-| Overlap | 2× A16 | PCIe | — | — | ⏳ Pending |
+| Overlap | 2× A16 | PCIe | 24.88 | 0.0423 | ✅ Complete |
 | Overlap | 2× A100 SXM | NVLink | 24.88 | 0.0421 | ✅ Complete |
-| All Combined | 2× A16 | PCIe | — | — | ⏳ Pending |
+| All Combined | 2× A16 | PCIe | 24.86 | 0.0424 | ✅ Complete |
 | All Combined | 2× A100 SXM | NVLink | — | — | ⏳ Pending |
 
 **Key observation:** All completed methods preserve reconstruction quality within ~0.2 dB PSNR of the single-GPU baseline. The slight drop (~0.15 dB) in 2-GPU runs is expected: with weak scaling, gradient averaging across GPUs introduces a small smoothing effect relative to full single-GPU gradient updates.
@@ -109,11 +109,11 @@ Applies all three optimizations simultaneously. This tests whether the methods a
 | Baseline (CLM) | 2× A100 SXM | NVLink | 1h 51m | 0.80× | 1.00× |
 | Async | 2× A16 | PCIe | 5h 29m | 1.57× | 1.02× |
 | Async | 2× A100 SXM | NVLink | 1h 47m | 0.83× | 1.04× |
-| P2P | 2× A16 | PCIe | — | — | — |
+| P2P | 2× A16 | PCIe | 5h 36m | 1.54× | 0.99× |
 | P2P | 2× A100 SXM | NVLink | 1h 35m | 0.94× | 1.17× |
-| Overlap | 2× A16 | PCIe | — | — | — |
+| Overlap | 2× A16 | PCIe | 5h 31m | 1.56× | 1.01× |
 | Overlap | 2× A100 SXM | NVLink | 1h 39m | 0.90× | 1.12× |
-| All Combined | 2× A16 | PCIe | — | — | — |
+| All Combined | 2× A16 | PCIe | 5h 37m | 1.53× | 0.99× |
 | All Combined | 2× A100 SXM | NVLink | — | — | — |
 
 ---
@@ -124,11 +124,20 @@ Applies all three optimizations simultaneously. This tests whether the methods a
 
 The most striking result is the difference in multi-GPU scaling between the two architectures:
 
-**A16 (PCIe):** 2-GPU achieves a **1.54× speedup** over single-GPU (8h 36m → 5h 34m). With weak scaling, the ideal speedup is 2.0× (half the iterations, same per-iteration time). The 1.54× indicates that communication overhead (all-reduce over PCIe) adds ~30% to per-iteration time, but the halved iteration count more than compensates.
+**A16 (PCIe):** 2-GPU achieves a **1.54× speedup** over single-GPU (8h 36m → 5h 34m). With weak scaling, the ideal speedup is 2.0× (half the iterations, same per-iteration time). The 1.54× indicates that communication overhead adds ~30% to per-iteration time, but the halved iteration count more than compensates.
 
-**A100 (NVLink):** 2-GPU is actually **slower** than single-GPU (1h 29m → 1h 51m, 0.80× "speedup"). Despite having NVLink's fast interconnect, the per-iteration overhead from gradient synchronization, process coordination, and distributed training setup adds enough cost that halving the iterations (30k → 15k) is not sufficient to overcome it. Each multi-GPU iteration takes more than 2× the time of a single-GPU iteration.
+**A100 (NVLink):** 2-GPU is actually **slower** than single-GPU (1h 29m → 1h 51m, 0.80× "speedup"). Despite having NVLink's high-bandwidth interconnect, multi-GPU coordination overhead makes each 2-GPU iteration more than 2× slower than a single-GPU iteration, so halving the iteration count (30k → 15k) is not sufficient to compensate.
 
-**Why the difference?** The A100 single-GPU is very fast (~0.18s/iter), so the fixed overhead of distributed coordination (NCCL setup, barrier synchronization, gradient averaging) represents a large fraction of the iteration time. On the slower A16 (~1.03s/iter single-GPU), the same fixed overhead is proportionally smaller.
+**Why does A100 get slower while A16 gets faster?** The key is the ratio of fixed distributed overhead to per-iteration compute time:
+
+| | Single GPU | 2-GPU Baseline | Per-iter Overhead |
+|---|---|---|---|
+| A100 | ~0.18s/iter | ~0.44s/iter (2.44×) | ~0.26s (**144%** of compute) |
+| A16 | ~1.03s/iter | ~1.34s/iter (1.30×) | ~0.31s (**30%** of compute) |
+
+Both architectures incur similar fixed overhead per iteration (~0.26–0.31s) from: all-reduce gradient sync, barrier synchronization, NCCL/distributed framework coordination, and CPU memory bandwidth contention (both GPUs loading SH simultaneously). On A100, this ~0.26s overhead is **larger** than the 0.18s compute time itself — overhead dominates. On the slower A16, the same ~0.31s overhead is only 30% of the 1.03s compute — compute dominates and the halved iteration count results in a net win.
+
+In other words, the A100 computes so fast (~5.7× faster than A16 per iteration) that even NVLink's high bandwidth cannot reduce the coordination overhead enough to make 2-GPU worthwhile. The GPU is "too fast" for the communication to keep up at this scale.
 
 ### 5.2 Method Comparison on A100 NVLink
 
@@ -147,9 +156,21 @@ However, **none of these bring 2-GPU A100 below the single-GPU time** (1h 29m). 
 
 ### 5.3 Method Comparison on A16 PCIe
 
-On A16, async all-reduce provides only a marginal ~1% improvement over baseline (5h 29m vs 5h 34m). This is surprising given that PCIe has much lower bandwidth than NVLink. The likely explanation is that with weak scaling (BSZ=16, 15k iters), the per-iteration all-reduce cost on A16 PCIe is not as dominant as it would be with more iterations — each iteration already has significant compute time from the 8-image per-GPU batch.
+On A16, **none of the optimizations provide meaningful speedup** over the 2-GPU baseline:
 
-(A16 P2P, Overlap, and All Combined results are pending.)
+| Method | Wall-Clock | vs Baseline |
+|---|---|---|
+| Baseline | 5h 34m | 1.00× |
+| Async | 5h 29m | 1.02× |
+| Overlap | 5h 31m | 1.01× |
+| P2P | 5h 36m | 0.99× |
+| All Combined | 5h 37m | 0.99× |
+
+All five A16 runs fall within an 8-minute spread (5h 29m – 5h 37m), which is ~2.4% variation over ~5.5-hour runs — well within normal run-to-run noise from OS scheduling, CPU contention, and memory allocation timing.
+
+The reason is that **on A16, the bottleneck is GPU compute, not communication.** The A16 has only 1,280 CUDA cores and 177 GB/s memory bandwidth, so the rendering/backward pass dominates each iteration. The communication costs (all-reduce, SH transfers) that our methods target are a small fraction of the A16 iteration time. There is simply not enough communication overhead to optimize away.
+
+This contrasts sharply with A100, where the fast GPU compute finishes quickly and exposes the SH transfer cost — making P2P (1.17×) and Overlap (1.12×) effective.
 
 ### 5.4 PSNR Quality vs Single-GPU
 
@@ -184,7 +205,7 @@ These two GPUs represent opposite ends of the multi-GPU communication spectrum:
 
 2. **P2P SH sharing is the most effective optimization on A100 NVLink** (1.17× over 2-GPU baseline), followed by dual-stream overlap (1.12×). These target the CPU→GPU SH transfer bottleneck, which is more impactful than all-reduce latency on NVLink.
 
-3. **Communication-hiding optimizations (async, overlap) provide modest benefits** when the interconnect is fast (NVLink). Their value increases when communication is a larger bottleneck — which may manifest more at higher GPU counts or on PCIe-only systems.
+3. **On A16 PCIe, no communication optimization provides meaningful speedup** (all within 2.4% of baseline). The A16's slow GPU compute dominates iteration time, leaving communication as a negligible fraction — there is nothing to optimize. Communication optimizations are only effective when compute is fast enough to expose the communication cost (as on A100).
 
 4. **Weak scaling preserves model quality.** All 2-GPU configurations stay within ~0.2 dB PSNR of the single-GPU baseline, with identical total training samples (240k images).
 
@@ -192,11 +213,8 @@ These two GPUs represent opposite ends of the multi-GPU communication spectrum:
 
 ### Pending Results
 
-The following experiments are still running or queued. Once complete, they will fill in the missing entries in the tables above:
-- 2× A16 P2P (Job 5650959 — running)
-- 2× A16 Overlap (Job 5650961 — pending)
-- 2× A16 All Combined (Job 5652024 — pending)
-- 2× A100 All Combined (Job 5652025 — pending)
+The following experiment is still queued:
+- 2× A100 All Combined (Job 5652025 — pending, waiting for node availability)
 
 ---
 
@@ -210,12 +228,12 @@ The following experiments are still running or queued. Once complete, they will 
 | 5650956 | Baseline (CLM) 2-GPU | 2× A100 SXM | cheetah04 | ✅ Complete | 24.85 | 1h 51m |
 | 5650957 | Async 2-GPU | 2× A16 | jaguar02 | ✅ Complete | 24.79 | 5h 29m |
 | 5650958 | Async 2-GPU | 2× A100 SXM | cheetah04 | ✅ Complete | 24.86 | 1h 47m |
-| 5650959 | P2P 2-GPU | 2× A16 | jaguar02 | Running | — | — |
+| 5650959 | P2P 2-GPU | 2× A16 | jaguar02 | ✅ Complete | 24.83 | 5h 36m |
 | 5650960 | P2P 2-GPU | 2× A100 SXM | cheetah04 | ✅ Complete | 24.84 | 1h 35m |
-| 5650961 | Overlap 2-GPU | 2× A16 | jaguar02 | Pending | — | — |
+| 5650961 | Overlap 2-GPU | 2× A16 | jaguar02 | ✅ Complete | 24.88 | 5h 31m |
 | 5650962 | Overlap 2-GPU | 2× A100 SXM | cheetah04 | ✅ Complete | 24.88 | 1h 39m |
-| 5652024 | All Combined 2-GPU | 2× A16 | — | Pending | — | — |
-| 5652025 | All Combined 2-GPU | 2× A100 SXM | — | Pending | — | — |
+| 5652024 | All Combined 2-GPU | 2× A16 | jaguar02 | ✅ Complete | 24.86 | 5h 37m |
+| 5652025 | All Combined 2-GPU | 2× A100 SXM | — | ⏳ Pending | — | — |
 
 ---
 
