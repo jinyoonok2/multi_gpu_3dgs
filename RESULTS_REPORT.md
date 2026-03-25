@@ -210,12 +210,12 @@ The following experiments are still running or queued. Once complete, they will 
 | 5650956 | Baseline (CLM) 2-GPU | 2× A100 SXM | cheetah04 | ✅ Complete | 24.85 | 1h 51m |
 | 5650957 | Async 2-GPU | 2× A16 | jaguar02 | ✅ Complete | 24.79 | 5h 29m |
 | 5650958 | Async 2-GPU | 2× A100 SXM | cheetah04 | ✅ Complete | 24.86 | 1h 47m |
-| 5650959 | P2P 2-GPU | 2× A16 | jaguar02 | 🔄 Running | — | — |
+| 5650959 | P2P 2-GPU | 2× A16 | jaguar02 | Running | — | — |
 | 5650960 | P2P 2-GPU | 2× A100 SXM | cheetah04 | ✅ Complete | 24.84 | 1h 35m |
-| 5650961 | Overlap 2-GPU | 2× A16 | jaguar02 | ⏳ Pending | — | — |
+| 5650961 | Overlap 2-GPU | 2× A16 | jaguar02 | Pending | — | — |
 | 5650962 | Overlap 2-GPU | 2× A100 SXM | cheetah04 | ✅ Complete | 24.88 | 1h 39m |
-| 5652024 | All Combined 2-GPU | 2× A16 | — | ⏳ Pending | — | — |
-| 5652025 | All Combined 2-GPU | 2× A100 SXM | — | ⏳ Pending | — | — |
+| 5652024 | All Combined 2-GPU | 2× A16 | — | Pending | — | — |
+| 5652025 | All Combined 2-GPU | 2× A100 SXM | — | Pending | — | — |
 
 ---
 
